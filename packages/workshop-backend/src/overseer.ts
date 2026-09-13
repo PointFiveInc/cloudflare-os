@@ -6961,16 +6961,13 @@ class OverseerImpl implements AgentHooks {
       // them. (`allowDuringTurn` because the callers set activeAgent before starting us.)
       this.materializeChatChanges(chatId, undefined, {allowDuringTurn: true});
 
-      // Enforce the optional free-tier usage limit before starting a user-initiated turn. Callback-
-      // initiated turns are exempt. (Historically this was so a caller blocked on a callback's
-      // return value was never stranded; callbacks no longer return values, so the exemption is
-      // now a policy choice -- a blocked turn would leave the callback message in the chat
-      // unhandled -- kept as is pending the "needs attention" work.)
+      // Enforce the optional free-tier usage limit before starting the turn, and resolve whether
+      // it bills the owner's own gateway.
       // When the Cloudflare limits flow is disabled, checkUsageAndBalance() always allows.
       // (This runs inside the try so the `finally` below still clears the active-agent state and
       // emits a stream "clear" — otherwise the UI would spin forever on a block.)
       let byokRouting: UserGatewayRouting | undefined;
-      if (!callbackInitiated && this.ownerId) {
+      if (this.ownerId) {
         let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
         let usage = await checkUsageAndBalance(this.env, ownerStub);
         if (!usage.allowed) {
