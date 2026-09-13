@@ -2384,9 +2384,7 @@ export async function runAgent(
 
     // Split the system prompt into static and dynamic parts for better caching.
     systemPromptSlots = [
-      instanceInstructions
-          ? `${SPAWNER_SYSTEM_PROMPT}\n\n${instanceInstructions}`
-          : SPAWNER_SYSTEM_PROMPT,
+      SPAWNER_SYSTEM_PROMPT,
       alwaysAvailableResourcesPrompt
           ? `${systemPromptBindings}\n\n${alwaysAvailableResourcesPrompt}`
           : systemPromptBindings,
@@ -2493,17 +2491,18 @@ export async function runAgent(
 
     // Split the system prompt into static and dynamic parts for better caching.
     systemPromptSlots = [
-      instanceInstructions
-          ? `${SYSTEM_PROMPT}\n\n${instanceInstructions}`
-          : SYSTEM_PROMPT,
+      SYSTEM_PROMPT,
       (standardFormats ? `${standardFormats}\n\n` : "") +
           `${systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
   }
 
-  // Apply the same communication guidance to regular and spawned agents.
+  // Shared guidance precedes deployment instructions for both agent types.
   systemPromptSlots[0] += `\n\n${COMMUNICATION_GUIDANCE}`;
+  if (instanceInstructions) {
+    systemPromptSlots[0] += `\n\n${instanceInstructions}`;
+  }
   let systemPrompt = `${systemPromptSlots[0]}\n\n${systemPromptSlots[1]}`;
 
   // Some models charge their response to the same window as the prompt, so the reservation is both
