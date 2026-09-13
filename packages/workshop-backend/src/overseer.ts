@@ -205,13 +205,10 @@ class RestoreForgerImpl extends NativeRpcTarget {
 
 // =======================================================================================
 
-// Per-chat in-memory state, used while an agent is running or agent callbacks are pending.
+// Per-chat in-memory state, used while an agent is running.
 type LiveChatContext = {
-  // Abort controller for the running agent (if any).
+  // Abort controller for the running agent.
   cancelController: AbortController;
-
-  // Callbacks queued while the agent is running, to be delivered once it finishes.
-  pendingAgentCallbacks: QueuedAgentCallback[];
 };
 
 type PreparedChatMessage = {
@@ -220,14 +217,16 @@ type PreparedChatMessage = {
   skillName?: string;
 };
 
-// A agent callback that arrived while the agent was running, queued for delivery once the
-// agent finishes.
-type QueuedAgentCallback = {
+// A call made on a callable agent (the `self` object or a spawnCallable() stub) that has not yet
+// been appended to its chat log. See the `pendingAgentCalls` collection.
+type PendingAgentCallRecord = {
+  chatId: number;
+  callId: number;             // from the nextAgentCallId singleton; the key is chatId.callId
   methodName: string;
-  args: unknown[];            // original args; must be storable (persistent stubs only)
-  argsSummary: string;        // depth-limited summary string
+  args: unknown[];            // must be storable: any RPC stubs among them are persistent stubs
+  argsSummary: string;        // depth-limited summary string (see summarizeArgs)
   initiatorUserId: string;    // hex durable object ID of user DO
-  initiatorModelId: string;
+  initiatorModelId: string | null;  // null when the spawner has no model (see spawnAgent)
 };
 
 type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
@@ -928,6 +927,10 @@ const CHAT_CHANGE_CLIENT_ID_PATTERN = /^[0-9A-Za-z_-]{1,64}$/;
 
 const AGENT_RESPONSE_DELIVERED_RETENTION_MS = 24 * 60 * 60 * 1000;
 
+// How long after agent work becomes outstanding (a turn starts, or a call to a callable agent is
+// recorded) the keep-alive alarm fires. See #agentKeepAliveTime.
+const AGENT_KEEPALIVE_ALARM_MS = 60_000;
+
 // Safely convert an unknown thrown value to a human-readable string.
 // Plain objects would otherwise render as "[object Object]".
 function stringifyError(err: unknown): string {
@@ -1118,6 +1121,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       nextActionId: 0,
       nextChatId: 0,
       nextHookId: 0,
+      nextAgentCallId: 0,
 
       // Permanent tombstones for deleted worktrees' workpiece ids, consulted only by the
       // client-delivery stripping (see stripWorktreeChangeEntries): a revert covering a
@@ -1346,6 +1350,17 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         }
       }),
 
+      // Calls delivered to a callable agent that have not yet been appended to its chat log.
+      // Written synchronously by deliverAgentCallback so a call is durable the moment the
+      // caller's RPC returns; drained into agentCallback messages (and agentCallbackArgs records)
+      // by drainPendingAgentCalls at turn boundaries. Keyed by chatId.callId so a chat's calls
+      // list in arrival order.
+      pendingAgentCalls: collection<PendingAgentCallRecord>()({
+        primaryKey(entry) {
+          return `${keyString(entry.chatId)}.${keyString(entry.callId)}`;
+        }
+      }),
+
       // Model-facing snapshots of agent steps, replayed verbatim on later turns so reasoning
       // (including provider-opaque signatures) and true model provenance survive turn boundaries
       // and restarts. Stored separately from the chat messages so these payloads -- opaque and
@@ -1545,7 +1560,7 @@ class OverseerImpl implements AgentHooks {
   // from this via `new GitCacheImpl(...)`.
   readonly gitCache: WorkspaceGitCache;
 
-  // Per-chat in-memory state for running agents and pending agent callbacks.
+  // Per-chat in-memory state for running agents.
   #liveChats = new Map<number, LiveChatContext>();
   #chatSubscribers: Set<RpcStub<AiChatSubscriber>> = new Set();
 
@@ -1553,20 +1568,30 @@ class OverseerImpl implements AgentHooks {
 
   #preparingChatMessages = new Map<number, Promise<void>>();
 
-  // Set of chatIds that currently have a running agent turn. Used to manage the DO alarm (held
-  // while any agent runs) and to let `alarm()` wait for all agents to finish.
+  // Set of chatIds that currently have a running agent turn. Feeds the alarm (see
+  // #agentKeepAliveTime) and lets `alarm()` wait for all agents to finish.
   #runningAgents = new Set<number>();
 
   // If `alarm()` is currently waiting for all agents to finish, this resolves its wait. Invoked
   // when the running-agent count drops to zero.
   #allAgentsIdleWaiters: (() => void)[] = [];
 
-  // How long to set the keep-alive alarm into the future. Whenever the agent count goes from zero
-  // to one, we schedule an alarm this far out; whenever it drops back to zero, we clear it. The
-  // alarm guarantees the DO is restarted (and the agents resumed) after a server restart, even if
-  // no client reconnects. While an agent is actively running and the DO is alive, the agent itself
-  // keeps the DO alive, so the alarm typically never fires.
-  static #AGENT_KEEPALIVE_ALARM_MS = 60_000;
+  // While agent work is outstanding -- a running turn, or a recorded call to a callable agent not
+  // yet appended to its chat (see `pendingAgentCalls`) -- the time from which we can no longer
+  // count on a client event to keep the DO alive, and so need an alarm handler running to do it
+  // instead. Set when such work first becomes outstanding, cleared when none remains, and
+  // otherwise held fixed: a recompute must not push it out, or the handler could start too late.
+  // The same alarm also wakes the DO if it died meanwhile (the constructor then resumes the turns
+  // and drains the calls before alarm() runs). While the DO is alive and busy the work itself
+  // keeps it up, so the alarm typically fires only in the two cases it exists for. See
+  // #updateAlarm.
+  #agentKeepAliveTime?: number;
+
+  // True while alarm() runs (see runAlarmTasks); #updateAlarm defers to its end.
+  #inAlarmHandler = false;
+
+  // Drains of pending agent calls currently in flight, by chat (see drainPendingAgentCalls).
+  #pendingCallDrains = new Map<number, Promise<void>>();
 
   addChatSubscriber(subscriber: RpcStub<AiChatSubscriber>) {
     this.#chatSubscribers.add(subscriber);
@@ -1700,15 +1725,15 @@ class OverseerImpl implements AgentHooks {
     if (!ctx) {
       ctx = {
         cancelController: new AbortController(),
-        pendingAgentCallbacks: [],
       };
       this.#liveChats.set(chatId, ctx);
     }
     return ctx;
   }
 
-  // Forcefully tear down all live state for a chat (e.g. on deletion).
-  // Cancels any running agent and drops any queued callbacks.
+  // Forcefully tear down all live state for a chat (e.g. on deletion). Cancels any running agent.
+  // (Undelivered calls to the agent live in storage -- `pendingAgentCalls` -- not here; deleteChat
+  // removes them itself.)
   destroyLiveChat(chatId: number) {
     let ctx = this.#liveChats.get(chatId);
     if (!ctx) return;
@@ -1731,26 +1756,21 @@ class OverseerImpl implements AgentHooks {
   // `activeAgents` record, so that the three representations of "an agent is running for this chat"
   // stay consistent. `#unregisterRunningAgent` performs the matching teardown.
   #registerRunningAgent(chatId: number) {
-    let wasEmpty = this.#runningAgents.size === 0;
     this.#runningAgents.add(chatId);
-    if (wasEmpty) {
-      // Zero -> one running agents: schedule the keep-alive alarm.
-      this.ctx.storage.setAlarm(Date.now() + OverseerImpl.#AGENT_KEEPALIVE_ALARM_MS);
-    }
+    this.#updateAlarm();
   }
 
   // Tear down all bookkeeping for a finished agent turn: remove it from the in-memory registry,
-  // delete its persistent `activeAgents` record, and clear the keep-alive alarm if no agents remain.
-  // MUST be called synchronously together with clearing `chatMeta.activeAgent`, so that the moment
-  // the chat is observably idle, no stale records of the previous agent remain (which would
-  // otherwise interfere if the user immediately starts a new agent).
+  // delete its persistent `activeAgents` record, and recompute the alarm. MUST be called
+  // synchronously together with clearing `chatMeta.activeAgent`, so that the moment the chat is
+  // observably idle, no stale records of the previous agent remain (which would otherwise
+  // interfere if the user immediately starts a new agent).
   #unregisterRunningAgent(chatId: number) {
     this.#runningAgents.delete(chatId);
     this.storage.activeAgents.delete(chatId);
+    this.#updateAlarm();
     if (this.#runningAgents.size === 0) {
-      // One -> zero running agents: replace the keep-alive alarm with any response-target retry/sweep
-      // alarm that is now due, and wake any `alarm()` waiter.
-      this.#updateExternalMessageResponseDeliveryAlarm();
+      // One -> zero running agents: wake any `alarm()` waiter.
       for (let waiter of this.#allAgentsIdleWaiters) {
         waiter();
       }
@@ -1758,27 +1778,76 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  #updateExternalMessageResponseDeliveryAlarm(): void {
-    if (this.#runningAgents.size > 0) return;
+  // This DO has one alarm, and this is its only writer: the alarm is the earliest of the times at
+  // which some concern needs the handler to run, and alarm() then handles all of them. Call it
+  // after changing any state a concern derives from; a concern that recomputes to the same time
+  // is a harmless re-set, and none can clobber another.
+  //
+  // A no-op while the handler itself is running: the DO is alive for as long as that lasts, and
+  // runAlarmTasks recomputes once, from a settled state, when it ends.
+  #updateAlarm(): void {
+    if (this.#inAlarmHandler) return;
 
-    // This DO has one alarm shared by agent keep-alive, response-target retry, and delivered-record sweep.
-    // Recompute from storage whenever the alarm may have been overwritten by another concern.
+    let times: number[] = [];
+
+    // Outstanding agent work: see #agentKeepAliveTime for why it is set once and held.
+    let hasAgentWork = this.#runningAgents.size > 0 ||
+        Array.from(this.storage.pendingAgentCalls.list({ limit: 1 })).length > 0;
+    if (!hasAgentWork) {
+      this.#agentKeepAliveTime = undefined;
+    } else {
+      this.#agentKeepAliveTime ??= Date.now() + AGENT_KEEPALIVE_ALARM_MS;
+      times.push(this.#agentKeepAliveTime);
+    }
+
+    // External-message responses: a ready one is delivered as soon as possible, and delivered
+    // records are swept once they age out.
     this.#sweepDeliveredExternalMessageResponses();
-
     let hasReadyExternalMessageResponse = [...this.storage.gadgetResponseDeliveries.readyByIdempotencyKey.list({ limit: 1 })]
       .length > 0;
     if (hasReadyExternalMessageResponse) {
-      this.ctx.storage.setAlarm(Date.now());
-      return;
+      times.push(Date.now());
     }
-
     let nextDeliveredRecord = [...this.storage.gadgetResponseDeliveries.deliveredByDeliveredAt.list({ limit: 1 })][0];
     if (nextDeliveredRecord?.status === "delivered") {
-      this.ctx.storage.setAlarm(nextDeliveredRecord.deliveredAt + AGENT_RESPONSE_DELIVERED_RETENTION_MS);
-      return;
+      times.push(nextDeliveredRecord.deliveredAt + AGENT_RESPONSE_DELIVERED_RETENTION_MS);
     }
 
-    this.ctx.storage.deleteAlarm();
+    if (times.length > 0) {
+      this.ctx.storage.setAlarm(Math.min(...times));
+    } else {
+      this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  // The body of the alarm handler: perform every concern the alarm exists for, together, and hold
+  // the DO open until all of them are done. They run concurrently so none waits on another -- in
+  // particular a response retry never waits behind an unrelated chat's long turn -- and since work
+  // begets work (a drain starts a turn, a turn's end drains more calls), passes repeat until one
+  // ends with no turn running and no drain in flight. Both checks are needed: between a turn's end
+  // and the next turn's start, the only sign of work in progress is the drain (which the next pass
+  // joins, being single-flight). A drain that fails leaves its calls recorded rather than looping
+  // here; the recompute at the end re-arms the alarm for them, starting a fresh keep-alive period
+  // from now rather than re-firing on the time that has just passed. A delivery failure is
+  // rethrown once everything else has settled, so the platform retries the alarm.
+  async runAlarmTasks(): Promise<void> {
+    this.#inAlarmHandler = true;
+    try {
+      do {
+        let results = await Promise.allSettled([
+          this.waitForAllAgentsToComplete(),
+          this.drainAllPendingAgentCalls(),
+          this.deliverReadyExternalMessageResponses(),
+        ]);
+        for (let result of results) {
+          if (result.status === "rejected") throw result.reason;
+        }
+      } while (this.#runningAgents.size > 0 || this.#pendingCallDrains.size > 0);
+    } finally {
+      this.#inAlarmHandler = false;
+      this.#agentKeepAliveTime = undefined;
+      this.#updateAlarm();
+    }
   }
 
   #deleteExternalMessageResponseDeliveryRecord(record: ExternalMessageRecord): void {
@@ -1835,12 +1904,29 @@ class OverseerImpl implements AgentHooks {
         this.storage.chatMeta.put(meta);
       }
       this.#unregisterRunningAgent(record.chatId);
-      this.#deliverWaitingExternalMessageResponse(record.chatId);
+      this.#finishAgentTurn(record.chatId);
       return;
     }
 
     await this.#runAgentTurn(
         record.chatId, aiModel, record.initiator, record.callbackInitiated, liveChat);
+  }
+
+  // The hand-off once a chat's turn is over and its running-agent state has been torn down: drop
+  // the turn's live context, then deliver whatever was waiting for the chat to go idle -- calls
+  // to the agent recorded during the turn (which start another turn), or failing that the
+  // response an external message is waiting on. Every path that ends a turn goes through here,
+  // so a call recorded mid-turn is never stranded by the way the turn ended.
+  #finishAgentTurn(chatId: number): void {
+    // A turn started by the drain gets a fresh context, and with it a fresh cancel controller --
+    // this one may have been aborted.
+    this.#liveChats.delete(chatId);
+
+    if (this.hasPendingAgentCalls(chatId)) {
+      this.drainPendingAgentCalls(chatId);
+    } else {
+      this.#deliverWaitingExternalMessageResponse(chatId);
+    }
   }
 
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
@@ -1933,6 +2019,11 @@ class OverseerImpl implements AgentHooks {
         this.#deliverWaitingExternalMessageResponse(thread.id);
       }
     }
+
+    // Deliver any calls to callable agents that were recorded but not yet appended to their chat
+    // when the previous instance went away. (A chat whose turn was just resumed drains at the end
+    // of that turn instead.)
+    this.drainAllPendingAgentCalls();
   }
 
   // Runs the git-storage migration (see git-migration.ts) and stamps schema version 2. The
@@ -5251,10 +5342,11 @@ class OverseerImpl implements AgentHooks {
         if (this.#preparingChatMessages.get(chatId) !== done) return;
         this.#preparingChatMessages.delete(chatId);
         resolve();
-        let meta = this.storage.chatMeta.get(chatId);
-        let liveChat = this.#liveChats.get(chatId);
-        if (liveChat?.pendingAgentCallbacks.length && !meta?.activeAgent) {
-          this.#startAgentForCallbacks(meta, liveChat);
+        // Calls to the agent that arrived during the preparation were recorded but not kicked
+        // (see deliverAgentCallback); if the preparation didn't end up starting a turn, deliver
+        // them now.
+        if (!this.storage.chatMeta.get(chatId)?.activeAgent && this.hasPendingAgentCalls(chatId)) {
+          this.drainPendingAgentCalls(chatId);
         }
       },
     };
@@ -6685,9 +6777,9 @@ class OverseerImpl implements AgentHooks {
 
     let readyRecord: ExternalMessageRecord = { ...record, status: "ready", responseText: text };
     this.storage.gadgetResponseDeliveries.put(readyRecord);
-    this.#updateExternalMessageResponseDeliveryAlarm();
+    this.#updateAlarm();
     this.ctx.waitUntil(this.#deliverExternalMessageResponseToTarget(readyRecord).finally(() => {
-      this.#updateExternalMessageResponseDeliveryAlarm();
+      this.#updateAlarm();
     }));
   }
 
@@ -6726,7 +6818,7 @@ class OverseerImpl implements AgentHooks {
     for (let result of results) {
       if (result.status === "rejected") throw result.reason;
     }
-    this.#updateExternalMessageResponseDeliveryAlarm();
+    this.#updateAlarm();
   }
 
   cancelAgent(chatId: number) {
@@ -7084,123 +7176,155 @@ class OverseerImpl implements AgentHooks {
 
       // Tear down the registry entry, persistent `activeAgents` record, and keep-alive alarm in the
       // same synchronous step as clearing `activeAgent` above, so the chat never appears idle while
-      // stale records of this agent linger. If pending callbacks below restart the agent, they'll
+      // stale records of this agent linger. If pending calls below restart the agent, it'll
       // re-register everything consistently.
       this.#unregisterRunningAgent(chatId);
 
-      // If any new messages were queued waiting for the agent to finish, deliver them now.
-      if (liveChat.pendingAgentCallbacks.length > 0) {
-        this.#startAgentForCallbacks(meta, liveChat);
-      } else {
-        this.#deliverWaitingExternalMessageResponse(chatId);
-
-        // LiveChatContext is now empty.
-        this.#liveChats.delete(chatId);
-      }
+      this.#finishAgentTurn(chatId);
     }
   }
 
-  // Called by AgentSelfLoopback when any method is called on the `self` object. Resolves once the
-  // call is queued for delivery; the agent handles it asynchronously and nothing is returned to
-  // the caller.
+  // Called by AgentSelfLoopback when any method is called on the `self` object or on a
+  // spawnCallable() stub. Resolves once the call is durably recorded; the agent handles it
+  // asynchronously and nothing is returned to the caller.
   async deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
-      initiatorUserId: string, initiatorModelId: string): Promise<void> {
+      initiatorUserId: string, initiatorModelId: string | null): Promise<void> {
     if (!this.ownerId) throw new Error("Workspace has been deleted.");
-
-    // Compute the summary eagerly (it only reads, doesn't mutate or need the sequence).
-    let argsSummary = summarizeArgs(args);
 
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) throw new Error("No such chatId: " + chatId);
 
-    // Register this callback in the pending callbacks for the chat.
-    let liveChat = this.#getLiveChat(chatId);
-    liveChat.pendingAgentCallbacks.push(
-        { methodName, args, argsSummary, initiatorUserId, initiatorModelId });
+    let callId = this.storage.nextAgentCallId.get();
+    try {
+      // The put serializes synchronously, so this is also where unstorable arguments are
+      // rejected -- in particular an RPC stub that isn't a persistent stub.
+      this.storage.pendingAgentCalls.put({
+        chatId,
+        callId,
+        methodName,
+        args,
+        argsSummary: summarizeArgs(args),
+        initiatorUserId,
+        initiatorModelId,
+      });
+    } catch (err) {
+      if ((err as {name?: unknown} | null)?.name === "DataCloneError") {
+        throw new Error(
+            "Arguments to a callable agent must be storable. RPC stubs must be persistent stubs " +
+            "created with ctx.restore(); see the agent spawner binding documentation. " +
+            `(${stringifyError(err)})`, {cause: err});
+      }
+      throw err;
+    }
+    this.storage.nextAgentCallId.put(callId + 1);
+    // In the same synchronous step, so the call is never recorded without a wake-up scheduled to
+    // deliver it should the DO die first (see #agentKeepAliveTime).
+    this.#updateAlarm();
 
-    // If there's no active agent right now, go ahead and start one.
-    //
-    // If the agent is running, we can't just add messages now since it'll confuse the agent, but
-    // once the agent finishes it will see the pending callbacks and start another turn.
+    // If the agent is running, we can't append to its chat now (that would confuse the turn in
+    // progress); its turn delivers the call when it ends. Likewise a message being prepared:
+    // the reservation's release delivers it. Otherwise deliver it now.
     if (!meta.activeAgent && !this.isPreparingChatMessage(chatId)) {
-      this.#startAgentForCallbacks(meta, liveChat);
+      this.drainPendingAgentCalls(chatId);
     }
   }
 
-  // Deliver one or more queued agent callbacks: append messages and start the agent. The callers
-  // were answered when their calls were queued, so any failure here is surfaced in the chat.
-  async #startAgentForCallbacks(
-      meta: AiChatMetadata | undefined, liveChat: LiveChatContext): Promise<void> {
-    let callbacks = liveChat.pendingAgentCallbacks;
+  // Whether any calls to the chat's agent are recorded but not yet appended to its chat log.
+  hasPendingAgentCalls(chatId: number): boolean {
+    return Array.from(this.storage.pendingAgentCalls.list(
+        {prefix: `${keyString(chatId)}.`, limit: 1})).length > 0;
+  }
+
+  // Drain every chat that has pending calls and no running turn (a running turn drains its own
+  // at its end). Called from the constructor (fire-and-forget, for wakes of any kind) and from the
+  // alarm handler (awaited, so the alarm's retry covers a failure).
+  drainAllPendingAgentCalls(): Promise<void> {
+    let chatIds = new Set<number>();
+    for (let record of this.storage.pendingAgentCalls.list()) {
+      chatIds.add(record.chatId);
+    }
+    return Promise.all(Array.from(chatIds)
+        .filter(chatId => !this.#runningAgents.has(chatId))
+        .map(chatId => this.drainPendingAgentCalls(chatId))).then(() => {});
+  }
+
+  // Append the chat's pending agent calls to its chat log as agentCallback messages and, if the
+  // initiator has a model, start the agent. Called whenever the chat may have become idle with
+  // calls pending; a no-op if it hasn't. The callers were answered when their calls were recorded,
+  // so any failure here is surfaced in the chat and the log, never to them.
+  //
+  // Most callers fire and forget, and this may die mid-way (a crash resets the DO). That is safe:
+  // a call stays recorded until the synchronous block below moves it into the log, so nothing is
+  // lost, and a recorded call counts as outstanding agent work for the alarm (see
+  // #agentKeepAliveTime), so the DO is woken to retry rather than waiting on the next event.
+  //
+  // Single-flight per chat: a kick while a drain is already in flight joins it rather than
+  // starting another (the in-flight one re-lists the records after its awaits, so it picks up
+  // anything recorded meanwhile). This is what lets runAlarmTasks see a drain as work in progress,
+  // and it keeps the constructor and the alarm handler, which may both kick the same chat, from
+  // resolving the model twice or reporting a failure twice.
+  drainPendingAgentCalls(chatId: number): Promise<void> {
+    let drain = this.#pendingCallDrains.get(chatId);
+    if (!drain) {
+      drain = this.#drainPendingAgentCalls(chatId)
+          .finally(() => this.#pendingCallDrains.delete(chatId));
+      this.#pendingCallDrains.set(chatId, drain);
+    }
+    return drain;
+  }
+
+  async #drainPendingAgentCalls(chatId: number): Promise<void> {
     let author: AiChatAuthorInfo | undefined;
-
     try {
-      if (callbacks.length === 0) {
-        // Shouldn't happen -- our callers only call us when the list is non-empty -- but just
-        // in case.
-        return;
+      let [first] = Array.from(this.storage.pendingAgentCalls.list(
+          {prefix: `${keyString(chatId)}.`, limit: 1}));
+      if (!first) return;
+
+      // Resolve the model and profile from the initiator of the first call, so if several calls
+      // are delivered in one turn it is charged to that one. A model that can't be resolved
+      // (deleted since) is final: the calls are still appended, with an error in place of a turn,
+      // so a human sees them and the alarm isn't retrying forever. For that we need the profile
+      // alone; if even that fails, the user DO itself is the problem, which is transient -- the
+      // calls stay recorded and the alarm retries.
+      let user = this.users.get(this.users.idFromString(first.initiatorUserId));
+      let userMeta: UserChatContext;
+      let modelError: unknown;
+      try {
+        userMeta = await user.getChatContext(first.initiatorModelId);
+      } catch (err) {
+        if (first.initiatorModelId === null) throw err;  // nothing model-related to fall back from
+        modelError = err;
+        userMeta = await user.getChatContext(null);
       }
-
-      if (!meta) throw new Error("Chat thread was deleted before callback was handled.");
-
-      let chatId = meta.id;
-
-      // Resolve the AI model based on the initiator of the first message. This means this
-      // turn gets charged to the first initiator, even if it ends up handling multiple messages.
-      // Oh well.
-      let user = this.users.get(this.users.idFromString(callbacks[0].initiatorUserId));
-
-      let userMeta = await user.getChatContext(callbacks[0].initiatorModelId);
       author = {
         type: "gadget",
         id: userMeta.profile.id,
         name: this.storage.title.get(),
       };
 
-      if (!userMeta.aiModel) {
-        throw new Error("No AI model configured for agent callback processing.");
-      }
-
-      // getChatContext() waits on the user's Durable Object. A user message may start an agent while
-      // that call is pending, so wait for message preparation to finish and then re-read chat state.
+      // getChatContext() waits on the user's Durable Object. A user message may start an agent
+      // while that call is pending, so wait for message preparation to finish and then re-read
+      // chat state. If a turn is running now, its end drains the calls instead.
       let preparation = this.waitForChatMessagePreparation(chatId);
       while (preparation) {
         await preparation;
         preparation = this.waitForChatMessagePreparation(chatId);
       }
-      meta = this.storage.chatMeta.get(chatId);
-      if (!meta) throw new Error("Chat thread was deleted before callback was handled.");
+      let meta = this.storage.chatMeta.get(chatId);
+      if (!meta) return;  // deleted meanwhile; deleteChat removed the calls too
       if (meta.activeAgent) return;
 
-      // We're about to actually prcoess these callbacks into the message history, so we can now
-      // remove them from the `LiveChatContext`. Any new callbacks queued after this point will
-      // have to wait for the next round.
-      liveChat.pendingAgentCallbacks = [];
-
-      let delivered = 0;
-      for (let cb of callbacks) {
+      // Move every recorded call into the chat log. No awaits from here to the turn start, so a
+      // crash cannot leave a call half-delivered, and a call recorded after this point waits for
+      // the turn to end.
+      let initiatorUserId = first.initiatorUserId;
+      for (let call of Array.from(this.storage.pendingAgentCalls.list(
+          {prefix: `${keyString(chatId)}.`}))) {
         let sequence = this.nextChatSequence(chatId);
-
-        // Store the args in a separate table (not sent to clients). This goes first: the put
-        // serializes synchronously and throws if the args aren't storable -- in particular if
-        // they contain an RPC stub that isn't a persistent stub -- and then no agentCallback
-        // message is written for the call. The caller has already been answered, so the failure
-        // is reported in the chat instead.
-        try {
-          this.storage.agentCallbackArgs.put({
-            chatId,
-            sequence,
-            args: cb.args,
-          });
-        } catch (err) {
-          this.postAgentErrorMessage(chatId, author,
-              `Dropped callback \`${cb.methodName}()\`: its arguments could not be stored. ` +
-              `RPC stubs passed to an agent must be persistent stubs (created with ` +
-              `ctx.restore()). ${stringifyError(err)}`);
-          continue;
-        }
-
+        // The args go in a separate table (not sent to clients); they were already proven
+        // storable when they were recorded.
+        this.storage.agentCallbackArgs.put({ chatId, sequence, args: call.args });
         this.storage.chats.put({
           chatId,
           sequence,
@@ -7208,32 +7332,45 @@ class OverseerImpl implements AgentHooks {
           author,
 
           type: "agentCallback",
-          methodName: cb.methodName,
-          argsSummary: cb.argsSummary,
+          methodName: call.methodName,
+          argsSummary: call.argsSummary,
         });
-        delivered++;
+        this.storage.pendingAgentCalls.delete(
+            `${keyString(call.chatId)}.${keyString(call.callId)}`);
       }
-      if (delivered === 0) return;
 
-      // Start the agent.
+      if (modelError !== undefined) {
+        this.logger.error("model unavailable for pending agent calls", {
+          event: "agent.callback.start.failed", error: modelError, chatId,
+        });
+        this.postAgentErrorMessage(chatId, author,
+            `Could not start the agent to handle its call(s): ${stringifyError(modelError)}`);
+        this.#deliverWaitingExternalMessageResponse(chatId);
+        return;
+      }
+      if (!userMeta.aiModel) {
+        // The spawner has no model: the calls sit in the chat for a human to pick up.
+        this.#deliverWaitingExternalMessageResponse(chatId);
+        return;
+      }
+
       meta.activeAgent = userMeta.aiModel.profile;
       meta.lastActive = this.getChatTimestamp();
       this.storage.chatMeta.put(meta);
-      this.startAgent(chatId, userMeta.aiModel, author, callbacks[0].initiatorUserId,
+      this.startAgent(chatId, userMeta.aiModel, author, initiatorUserId,
                       /* callbackInitiated */ true);
     } catch (err) {
-      // Failure to set up the agent. The queued callbacks are dropped; report that in the chat
-      // (when we got far enough to know who to attribute it to) and in the log.
-      liveChat.pendingAgentCallbacks = [];
-      this.logger.error("failed to start agent for callbacks", {
-        event: "agent.callback.start.failed", error: err,
-        ...(meta ? {chatId: meta.id} : {}),
+      this.logger.error("failed to deliver pending agent calls", {
+        event: "agent.callback.start.failed", error: err, chatId,
       });
-      if (meta && author) {
-        let methods = callbacks.map(cb => `\`${cb.methodName}()\``).join(", ");
-        this.postAgentErrorMessage(meta.id, author,
-            `Failed to deliver callback(s) ${methods}: ${stringifyError(err)}`);
+      if (author) {
+        this.postAgentErrorMessage(chatId, author,
+            `Failed to start the agent to handle its pending call(s): ${stringifyError(err)}`);
+        this.#deliverWaitingExternalMessageResponse(chatId);
       }
+    } finally {
+      // The set of pending calls changed (or a turn started): recompute the alarm.
+      this.#updateAlarm();
     }
   }
 
@@ -9530,19 +9667,21 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The alarm handler kicks in when we've had running agents that haven't completed for at least a
-   * minute. This serves a few purposes:
-   * - If the DO is still running when this is called, but the client has closed their browser and
-   *   so isn't holding the DO alive anymore, the alarm handler will take over and hold the DO
-   *   open until it's done.
-   * - If the DO somehow died since the agents were scheduled, the alarm will wake it up (and the
-   *   DO constructor will have rescheduled the agents, before alarm() itself runs).
-   * - If the DO dies *while* the alarm is running, the system will retry the alarm, thus resuming
-   *   the agents yet again.
+   * The DO's one alarm (scheduled by #updateAlarm for the earliest time any concern below needs
+   * it) does all of the following, so whichever concern set it, none is missed:
+   * - Agent work outstanding for at least a minute -- a running turn, or a recorded call to a
+   *   callable agent not yet appended to its chat. If the DO is still running when this is called,
+   *   but the client has closed their browser and so isn't holding the DO alive anymore, the alarm
+   *   handler takes over and holds the DO open until the work is done. If the DO died meanwhile,
+   *   the alarm wakes it (and the constructor resumes the turns and drains the calls before
+   *   alarm() itself runs). If the DO dies *while* the alarm is running, the system retries the
+   *   alarm, picking the work up yet again.
+   * - External-message responses ready to deliver, and delivered records due to be swept.
+   *
+   * See OverseerImpl.runAlarmTasks for how the concerns are run together.
    */
   async alarm() {
-    await this.impl.waitForAllAgentsToComplete();
-    await this.impl.deliverReadyExternalMessageResponses();
+    await this.impl.runAlarmTasks();
   }
 
   // Initialize a brand-new workspace's storage. (Before git-backed code storage this also wrote
@@ -9983,7 +10122,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   /** Called by AgentSelfLoopback when any method is called on the `self` object. */
   deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
-      initiatorUserId: string, initiatorModelId: string): Promise<void> {
+      initiatorUserId: string, initiatorModelId: string | null): Promise<void> {
     return this.impl.deliverAgentCallback(
         chatId, methodName, args, initiatorUserId, initiatorModelId);
   }
@@ -9992,9 +10131,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       title: string, prompt: string, config: AgentSpawnerConfig,
       creatorUserId?: string, callable?: boolean) {
     if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
-    if (callable && !config.modelId) {
-      throw new Error("Cannot create a callable agent without a model.");
-    }
 
     // Resolve the model from the creating user's account (falls back to owner for
     // bindings created before collaborator support).
@@ -10051,12 +10187,13 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     if (callable) {
       // Return a stub that delivers calls to the new chat thread, like the `self` magic object.
-      // The agent will be started on first callback via deliverAgentCallback().
+      // The agent will be started on first call via deliverAgentCallback(). With no model
+      // configured, calls are still appended to the chat, for a human to pick up.
       return this.impl.ctx.exports.AgentSelfLoopback({props: {
         overseerId: this.impl.ctx.id.toString(),
         chatId,
         initiatorUserId: this.impl.users.idFromString(resolveUserId).toString(),
-        initiatorModelId: config.modelId!,
+        initiatorModelId: config.modelId,
       }}) as any;
     } else if (userMeta.aiModel) {
       // Fire off the agent (asynchronously).
@@ -10183,16 +10320,17 @@ type AgentSelfLoopbackProps = {
   overseerId: string;
   chatId: number;
   initiatorUserId: string;
-  initiatorModelId: string;
+  initiatorModelId: string | null;  // null for a callable agent whose spawner has no model
 };
 
 /**
- * The `self` magic object passed to code executed via the agent's `executeCode` tool.
- * Calling any method on it (e.g., self.foo(123)) delivers a callback message to the chat
- * thread and activates the agent to respond. The call resolves once the callback is queued and
- * returns nothing; the arguments must be storable (any RPC stubs among them must be persistent
- * stubs). This is a WorkerEntrypoint so it produces a Fetcher that can be passed over RPC and
- * stored in Durable Object KV storage.
+ * The `self` magic object passed to code executed via the agent's `executeCode` tool, and the
+ * stub returned by an agent spawner's spawnCallable(). Calling any method on it (e.g.,
+ * self.foo(123)) delivers a callback message to the chat thread and activates the agent to
+ * respond. The call resolves once the callback is durably recorded and returns nothing; the
+ * arguments must be storable (any RPC stubs among them must be persistent stubs). This is a
+ * WorkerEntrypoint so it produces a Fetcher that can be passed over RPC and stored in Durable
+ * Object KV storage.
  * TODO: Would be awesome if the agent could pass a sub-object like `self.foo`, and then be told
  *   later e.g. "foo.callback() was called". This requires that we implement RpcPromise
  *   serializability in the built-in RPC system, matching Cap'n Web.
@@ -11572,11 +11710,16 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
     });
 
-    // Clean up agentCallbackArgs for this chat.
+    // Clean up agentCallbackArgs for this chat, and any calls to its agent not yet delivered.
     for (let entry of this.impl.storage.agentCallbackArgs.list(
         {prefix: `${keyString(chatId)}.`})) {
       this.impl.storage.agentCallbackArgs.delete(
           `${keyString(entry.chatId)}.${keyString(entry.sequence)}`);
+    }
+    for (let entry of Array.from(this.impl.storage.pendingAgentCalls.list(
+        {prefix: `${keyString(chatId)}.`}))) {
+      this.impl.storage.pendingAgentCalls.delete(
+          `${keyString(entry.chatId)}.${keyString(entry.callId)}`);
     }
 
     // Clean up the chat's model-facing snapshots.
