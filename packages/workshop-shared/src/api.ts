@@ -2923,9 +2923,9 @@ export type AiChatMessageBody = {
   argsSummary: string;
 } | {
   /**
-   * A system-generated nudge message sent to the agent when it tries to end its turn while
-   * agent callbacks are still unresolved. This is displayed as a user message to the LLM
-   * so it can be prompted to continue.
+   * **Obsolete.** A system-generated nudge message that was sent to the agent when it tried to
+   * end its turn while agent callbacks were still unresolved. No longer emitted since callable
+   * agents stopped returning values; retained so older chat logs remain readable.
    */
   type: "agentNudge";
   text: string;
@@ -3223,6 +3223,11 @@ export type AiToolCall = {
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
 } | {
+  /**
+   * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer
+   * emitted since callable agents stopped returning values; retained so older chat logs remain
+   * readable.
+   */
   toolName: "giveUp";
   input: {
     error: string;

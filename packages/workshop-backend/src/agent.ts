@@ -329,9 +329,8 @@ async function resolveBindingDescription(
     case "workpiece":
       return hooks.describeBinding(`env.${name}`, entry.id);
     case "value":
-      return `env.${name} holds the arguments of an agent callback: \`env.${name}.args\` is the ` +
-          `arguments array, and \`env.${name}.resolve(value)\` / \`env.${name}.reject(error)\` ` +
-          `complete the callback.`;
+      return `env.${name} is the arguments array of an agent callback (one element per ` +
+          `parameter of the call).`;
     default:
       return entry satisfies never;
   }
@@ -556,8 +555,6 @@ export interface AgentHooks {
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void,
                    worktreeTurn?: WorktreeTurnAccess): Promise<string>;
-  activeAgentCallbackCount(chatId: number): number;
-  rejectAllAgentCallbacks(chatId: number, error: string): void;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
@@ -975,7 +972,7 @@ Note that this differs from the \`env\` a Gadget's own code sees: a Gadget's ser
 
 When the user asks you to just do a task that can be done with these bindings, you should use executeCode to perform the task, instead of adding code to a gadget to do it.
 
-The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, delivers a callback message to this chat and activates you to respond. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When an agent callback is received, it appears in your env under a name like \`PARAMS_1\`, with \`.args\` (the callback arguments), \`.resolve(value)\` (to return a value to the caller), and \`.reject(error)\` (to reject with an error).
+The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, delivers a callback message to this chat and activates you to respond. The call itself returns immediately once you've been activated; it doesn't wait for you. The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When an agent callback is received, its arguments appear in your env as an array, under a name like \`PARAMS_1\` given in the callback message.
 `.trim();
 
 let LIST_CONNECTABLE_RESOURCES_TOOL_DESCRIPTION = `
@@ -984,10 +981,6 @@ List the resource types a gatekeeper vendor offers, so you can construct a resou
 
 let REQUEST_CONNECTION_TOOL_DESCRIPTION = `
 Ask the user to connect a gatekeeper resource (e.g. a ClickHouse cluster, a GitHub repo). Pre-configure as much as you can: always pass vendorId, and pass resourceUrl when you can infer it (use listConnectableResources to learn the URL patterns). The request must resolve to a specific resource: if you pass a resourceUrl it must match one of the vendor's patterns, and if the vendor offers multiple resource types with no whole-instance option you MUST pass a matching resourceUrl. Otherwise the call is rejected with guidance and no card is shown — fix the request and try again. You also choose \`bindingName\`: the name the resource will have in your env once connected (you know why you want the resource, so pick a name that reflects its role). On success this shows the user an accept/deny card in the chat. It does NOT block: your turn ends after a successful call, and you will be resumed once the user accepts (the resource becomes available as \`env.<bindingName>\`, which you can describeBinding and use from executeCode; wire it into a Gadget with setGadgetBinding only if the Gadget's code needs it) or denies (your turn simply ends; wait for the user's next message).
-`.trim();
-
-let GIVE_UP_TOOL_DESCRIPTION = `
-Gives up on handling the current callbacks, rejecting all outstanding callbacks with an error. Use this if you cannot fulfill the callbacks after attempting to do so.
 `.trim();
 
 // =======================================================================================
@@ -1119,7 +1112,6 @@ export async function runAgent(
     chatMessages: AiChatMessage[],
     abortSignal: AbortSignal,
     initiator: AiChatAuthorInfo,
-    callbackInitiated: boolean,
     compaction: CompactionContext): Promise<CompactionCheckpoint | undefined> {
   let checkpoint = compaction.checkpoint;
 
@@ -1907,6 +1899,7 @@ export async function runAgent(
                   toolOutput = {text: toolCall.output!};
                   break;
                 case "giveUp":
+                  // Obsolete tool: no longer offered, replayed for old chat logs only.
                   toolOutput = {text: jsonToolResultText({rejected: true})};
                   break;
                 case "webFetch":
@@ -2131,19 +2124,15 @@ export async function runAgent(
 
         let content =
             `A callback was received: \`self.${msg.methodName}()\`\n\n` +
-            `Arguments (env.${name}.args):\n${msg.argsSummary}\n\n` +
-            `Access the full data as \`env.${name}.args\` in executeCode. ` +
-            `You MUST resolve or reject this callback using ` +
-            `\`env.${name}.resolve(value)\` or \`env.${name}.reject(error)\`. ` +
-            `The caller is blocked until you do so. Once you resolve or reject all open ` +
-            `callbacks, your turn will end immediately; be sure to complete everything ` +
-            `you need to do before that.`;
+            `Arguments (env.${name}):\n${msg.argsSummary}\n\n` +
+            `Access the full arguments as \`env.${name}\` (an array) in executeCode.`;
 
         modelMessages.push({ role: "user", content, timestamp: msgTimestamp });
         break;
       }
 
       case "agentNudge":
+        // Obsolete: no longer emitted, replayed for old chat logs only.
         modelMessages.push({ role: "user", content: msg.text, timestamp: msgTimestamp });
         break;
 
@@ -3224,31 +3213,12 @@ export async function runAgent(
     }),
   };
 
-  // When the agent was started to handle callbacks, add the giveUp tool so it can bail out.
-  if (callbackInitiated) {
-    tools.giveUp = defineTool({
-      name: "giveUp",
-      label: "Give up",
-      description: GIVE_UP_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        error: Type.String({
-          description: "Error message explaining why the callbacks cannot be fulfilled.",
-        }),
-      }),
-      execute: async (_toolCallId, {error}) => {
-        hooks.rejectAllAgentCallbacks(chatId, error);
-        return toolResult(jsonToolResultText({rejected: true}));
-      }
-    });
-  }
-
   if (agentContext.spawnerConfig) {
     // Restrict sub-agents to a narrower set of tools: they can inspect and call bindings in code
     // (which is how they read reference knowledge), but not the full editing/connection surface.
     tools = {
       describeBinding: tools.describeBinding,
       executeCode: tools.executeCode,
-      ...(callbackInitiated ? {giveUp: tools.giveUp} : {}),
     };
   }
 
@@ -3492,9 +3462,7 @@ export async function runAgent(
         // in the same turn.
         connectionRequested ||
         // Wait for approval before continuing against state that may not reflect the action.
-        awaitingActionDecision ||
-        // Auto-terminate when callback-initiated and all callbacks have been resolved/rejected.
-        (callbackInitiated && hooks.activeAgentCallbackCount(chatId) === 0),
+        awaitingActionDecision,
   }, emit, abortSignal, handle.stream);
 
   // (No end-of-turn flush: every completed step's effects were barrier-committed with its
@@ -3553,53 +3521,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Produces the storable version of callback args: deep copy where NativeRpcStub instances
- * are replaced with TransientStubLoopback Fetchers. ServiceStub/Fetcher instances and other
- * native types are kept as-is. Throws if depth exceeds 64.
- *
- * Each transient RpcStub found is collected into `transientStubs` (side output). The
- * `replaceTransientStub` callback creates a TransientStubLoopback Fetcher for the given
- * stub index.
- */
-export function makeStorableArgs(
-    value: unknown,
-    replaceTransientStub: (stubIndex: number) => unknown,
-    // TODO: When NativeStub<unknown> works, change `any[]` to `NativeStub<unknown>[]`.
-    transientStubs: any[],
-    depth: number = 0): unknown {
-  if (depth > 64) {
-    throw new Error("Agent callback arguments exceed maximum nesting depth of 64.");
-  }
-
-  // Transient RPC stubs → collect and replace with loopback.
-  if (value instanceof NativeRpcStub) {
-    let index = transientStubs.length;
-    // @ts-ignore RPC types cause excessively deep instantiation.
-    transientStubs.push(value);
-    return replaceTransientStub(index);
-  }
-
-  if (Array.isArray(value)) {
-    return (value as unknown[]).map(
-        item => makeStorableArgs(item, replaceTransientStub, transientStubs, depth + 1));
-  }
-
-  // Recurse into plain objects.
-  if (isPlainObject(value)) {
-    let result: Record<string, unknown> = {};
-    for (let key of Object.keys(value)) {
-      result[key] = makeStorableArgs(
-          value[key], replaceTransientStub, transientStubs, depth + 1);
-    }
-    return result;
-  }
-
-  // Everything else (primitives, Dates, Uint8Arrays, Fetchers, etc.) kept as-is.
-  // TODO: Handle streams? Request? Response? Map? Set?
-  return value;
-}
-
-/**
  * Produces a depth-limited summary string for callback args. Stubs and large content are
  * replaced with placeholders.
  */
@@ -3633,13 +3554,16 @@ function summarizeValue(value: unknown, depth: number): string {
   }
 
   if (value instanceof NativeRpcStub) return "RpcStub";
+  // @ts-ignore RPC types cause excessively deep instantiation (a known bug in the Workers RPC
+  //   types: `RpcStub<any>` is infinitely recursive). The error is reported once, at whichever
+  //   line first triggers it -- here, on the narrowing that follows the instanceof check above.
   if (value instanceof Date) return `Date("${value.toISOString()}")`;
   if (value instanceof Uint8Array) return `Uint8Array(${value.length})`;
 
   // TODO: Export ServiceStub from cloudflare:workers so we can represent it here. For now we
   //   guess that it's a stub if it has the constructor name "Fetcher".
   if (typeof value === "object" && value.constructor?.name === "Fetcher") {
-    return "PersistentRpcStub";
+    return "ServiceStub";
   }
 
   if (Array.isArray(value)) {

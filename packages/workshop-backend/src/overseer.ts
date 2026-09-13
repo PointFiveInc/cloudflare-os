@@ -30,7 +30,7 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, makeStorableArgs, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess } from "./agent";
+import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
@@ -78,17 +78,8 @@ import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
   verify() {}
-  async run(self, callbackResolvers, restoreForger) {
+  async run(self, restoreForger) {
     let env = this.env;
-    if (callbackResolvers) {
-      for (let [index, {resolve, reject}] of Object.entries(callbackResolvers)) {
-        env[index] = {
-          args: env[index],
-          resolve,
-          reject,
-        };
-      }
-    }
     if (restoreForger) {
       // Graft the well-known \`restore\` symbol onto each service-binding stub in env, so the
       // executed code can call \`env.SOME_GADGET[restore](params)\` to forge a persistent stub
@@ -179,12 +170,7 @@ let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
 
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
-  run(self?: unknown,
-      callbackResolvers?: Record<string, {
-        resolve: NativeRpcStub<(v: unknown) => void>,
-        reject: NativeRpcStub<(e: unknown) => void>
-      }>,
-      restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
 }
 
 interface RestoreForgerEntrypoint extends WorkerEntrypoint {
@@ -226,15 +212,6 @@ type LiveChatContext = {
 
   // Callbacks queued while the agent is running, to be delivered once it finishes.
   pendingAgentCallbacks: QueuedAgentCallback[];
-
-  // Active agent callbacks being processed by the agent, keyed by message sequence number.
-  // Each entry holds the transient RPC stubs (live until the deliverAgentCallback RPC returns)
-  // and the resolve/reject for the return value promise.
-  activeAgentCallbacks: Map<number, {
-    transientStubs: any[];
-    resolve: (v: unknown) => void;
-    reject: (e: unknown) => void;
-  }>;
 };
 
 type PreparedChatMessage = {
@@ -247,12 +224,10 @@ type PreparedChatMessage = {
 // agent finishes.
 type QueuedAgentCallback = {
   methodName: string;
-  args: unknown[];            // original args (raw, with live transient stubs)
+  args: unknown[];            // original args; must be storable (persistent stubs only)
   argsSummary: string;        // depth-limited summary string
   initiatorUserId: string;    // hex durable object ID of user DO
   initiatorModelId: string;
-  resolve: (value: unknown) => void;
-  reject: (error: unknown) => void;
 };
 
 type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
@@ -1726,7 +1701,6 @@ class OverseerImpl implements AgentHooks {
       ctx = {
         cancelController: new AbortController(),
         pendingAgentCallbacks: [],
-        activeAgentCallbacks: new Map(),
       };
       this.#liveChats.set(chatId, ctx);
     }
@@ -1734,21 +1708,13 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Forcefully tear down all live state for a chat (e.g. on deletion).
-  // Cancels any running agent, rejects all pending callbacks and returns.
+  // Cancels any running agent and drops any queued callbacks.
   destroyLiveChat(chatId: number) {
     let ctx = this.#liveChats.get(chatId);
     if (!ctx) return;
 
-    let error = new Error("Chat deleted.");
-
     // Cancel running agent.
-    ctx.cancelController?.abort(error);
-
-    // Reject all active agent callback returns.
-    for (let [, cb] of ctx.activeAgentCallbacks) cb.reject(error);
-
-    // Reject all queued callbacks.
-    for (let cb of ctx.pendingAgentCallbacks) cb.reject(error);
+    ctx.cancelController?.abort(new Error("Chat deleted."));
 
     this.#liveChats.delete(chatId);
     this.invalidateChatContent(chatId);
@@ -3458,9 +3424,9 @@ class OverseerImpl implements AgentHooks {
           break;
         }
         case "value": {
-          // Agent callback arguments — embed the actual storable args value directly in env.
-          // The storable args already contain TransientStubLoopback Fetchers where transient
-          // stubs were, so they work directly in env.
+          // Agent callback arguments — embed the stored args array directly in env. Any stubs
+          // inside are persistent stubs (that is what made the record storable), so they work
+          // directly in env.
           let stored = this.storage.agentCallbackArgs.get(
               `${keyString(chatId)}.${keyString(entry.messageSequence)}`);
           if (!stored) {
@@ -6996,7 +6962,10 @@ class OverseerImpl implements AgentHooks {
       this.materializeChatChanges(chatId, undefined, {allowDuringTurn: true});
 
       // Enforce the optional free-tier usage limit before starting a user-initiated turn. Callback-
-      // initiated continuations are exempt so outstanding callbacks are never stranded mid-flow.
+      // initiated turns are exempt. (Historically this was so a caller blocked on a callback's
+      // return value was never stranded; callbacks no longer return values, so the exemption is
+      // now a policy choice -- a blocked turn would leave the callback message in the chat
+      // unhandled -- kept as is pending the "needs attention" work.)
       // When the Cloudflare limits flow is disabled, checkUsageAndBalance() always allows.
       // (This runs inside the try so the `finally` below still clears the active-agent state and
       // emits a stream "clear" — otherwise the UI would spin forever on a block.)
@@ -7033,17 +7002,14 @@ class OverseerImpl implements AgentHooks {
       let controller = liveChat.cancelController;
       controller.signal.throwIfAborted();
 
-      let hasBeenNudged = false;
-      let outcome: "ok" | "callbacks_stalled" = "ok";
       while (true) {
         let checkpoint = this.getActiveChatCompaction(chatId);
         let chatMessages = this.#listChatTail(chatId, checkpoint);
-        let callbackCountBefore = liveChat.activeAgentCallbacks.size;
 
         let compactionTurn = isCompactionTurn(chatMessages);
         let newCheckpoint = await runAgent(
             this, chosenModel, chatId, aiModel.profile, chatMessages, controller.signal,
-            initiator, callbackInitiated, {
+            initiator, {
               checkpoint,
               modelConfig: aiModel.config,
               measuredTokens: this.getChatMetaOrThrow(chatId).totalTokens ?? 0,
@@ -7053,57 +7019,10 @@ class OverseerImpl implements AgentHooks {
         // prompting the model, so rerun the turn now that the history is shorter. Each compaction
         // moves the boundary strictly forward and can never pass the newest turn start, so this
         // reruns a bounded number of times.
-        if (compactionTurn) break;
-        if (newCheckpoint) continue;
-
-        // If not callback-initiated, or all callbacks are resolved, we're done.
-        if (!callbackInitiated || liveChat.activeAgentCallbacks.size === 0) {
-          break;
-        }
-
-        // Callbacks still outstanding. Check if the agent made progress.
-        // On the first run we always nudge once (the agent may not have understood what
-        // was expected). After a nudge, we bail out if no progress was made.
-        if (hasBeenNudged && liveChat.activeAgentCallbacks.size >= callbackCountBefore) {
-          // No progress after being nudged — reject remaining callbacks and bail out.
-          let count = liveChat.activeAgentCallbacks.size;
-          this.rejectAllAgentCallbacks(chatId,
-              "Agent failed to resolve callbacks after multiple attempts.");
-          this.postAgentErrorMessage(chatId, aiModel.profile,
-              `Failed to resolve ${count} outstanding callback(s).`);
-          outcome = "callbacks_stalled";
-          break;
-        }
-
-        // Progress was made but callbacks remain. Nudge the agent with details about
-        // which callbacks are still outstanding so it knows exactly what to resolve.
-        let outstandingSeqs = new Set(liveChat.activeAgentCallbacks.keys());
-        let outstandingDescriptions: string[] = [];
-        // Reconstruct the PARAMS_<n> names the agent loop assigned to each callback (see
-        // chatScopeNames, which simulates the replay loop's allocation).
-        let reloadedMessages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
-        let callbackNames = new Map<number, string>();
-        this.chatScopeNames(chatId, reloadedMessages, callbackNames);
-        for (let msg of reloadedMessages) {
-          if (msg.type === "agentCallback" && outstandingSeqs.has(msg.sequence)) {
-            outstandingDescriptions.push(
-                `env.${callbackNames.get(msg.sequence)} (self.${msg.methodName}())`);
-          }
-        }
-
-        let nudgeText =
-            `You still have ${outstandingDescriptions.length} unresolved callback(s): ` +
-            `${outstandingDescriptions.join(", ")}. ` +
-            `Use executeCode to call env.PARAMS_N.resolve(value) or env.PARAMS_N.reject(error) ` +
-            `for each, or use giveUp to reject them all with an error.`;
-        this.addChatMessages(chatId, initiator, [{
-          type: "agentNudge",
-          text: nudgeText,
-        }]);
-        hasBeenNudged = true;
+        if (compactionTurn || !newCheckpoint) break;
       }
       turnLogger.debug("agent run finished", {
-        event: "agent.run.finished", outcome,
+        event: "agent.run.finished", outcome: "ok",
         durationMs: Date.now() - startedAt,
       });
     } catch (err: unknown) {
@@ -7140,13 +7059,6 @@ class OverseerImpl implements AgentHooks {
       });
 
       this.postAgentErrorMessage(chatId, aiModel.profile, errorMessage);
-
-      // Reject any pending agent callback return promises.
-      let error = err instanceof Error ? err : new Error(`${err}`);
-      for (let [, cb] of liveChat.activeAgentCallbacks) {
-        cb.reject(error);
-      }
-      liveChat.activeAgentCallbacks.clear();
     } finally {
       // If this turn billed the user's own Cloudflare account, refresh their cached balance now (in
       // the background) so the next turn's billing decision reflects the spend just incurred. Runs
@@ -7179,12 +7091,6 @@ class OverseerImpl implements AgentHooks {
       // re-register everything consistently.
       this.#unregisterRunningAgent(chatId);
 
-      // Resolve any agent callback returns that weren't explicitly returned (they get undefined).
-      for (let [, cb] of liveChat.activeAgentCallbacks) {
-        cb.resolve(undefined);
-      }
-      liveChat.activeAgentCallbacks.clear();
-
       // If any new messages were queued waiting for the agent to finish, deliver them now.
       if (liveChat.pendingAgentCallbacks.length > 0) {
         this.#startAgentForCallbacks(meta, liveChat);
@@ -7197,63 +7103,12 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // Resolve a agent callback return value, keyed by message sequence number.
-  resolveAgentCallback(chatId: number, sequence: number, value: unknown): void {
-    let liveChat = this.#liveChats.get(chatId);
-    if (!liveChat) return;
-    let cb = liveChat.activeAgentCallbacks.get(sequence);
-    if (cb) {
-      cb.resolve(value);
-      // Remove the entry — the transient stubs will be invalidated when the
-      // deliverAgentCallback RPC returns.
-      liveChat.activeAgentCallbacks.delete(sequence);
-    }
-  }
-
-  // Reject a agent callback, keyed by message sequence number.
-  rejectAgentCallback(chatId: number, sequence: number, error: unknown): void {
-    let liveChat = this.#liveChats.get(chatId);
-    if (!liveChat) return;
-    let cb = liveChat.activeAgentCallbacks.get(sequence);
-    if (cb) {
-      cb.reject(error instanceof Error ? error : new Error(`${error}`));
-      liveChat.activeAgentCallbacks.delete(sequence);
-    }
-  }
-
-  // Returns the number of active (unresolved) agent callbacks for the given chat.
-  activeAgentCallbackCount(chatId: number): number {
-    return this.#liveChats.get(chatId)?.activeAgentCallbacks.size ?? 0;
-  }
-
-  // Reject all active agent callbacks for the given chat with the given error.
-  rejectAllAgentCallbacks(chatId: number, error: string): void {
-    let liveChat = this.#liveChats.get(chatId);
-    if (!liveChat) return;
-    let err = new Error(error);
-    for (let [, cb] of liveChat.activeAgentCallbacks) {
-      cb.reject(err);
-    }
-    liveChat.activeAgentCallbacks.clear();
-  }
-
-  // Retrieve a transient RPC stub from a agent callback by message sequence and stub index.
-  // Called by TransientStubLoopback.
-  getTransientStub(chatId: number, sequence: number, stubIndex: number): any {
-    let stubs = this.#liveChats.get(chatId)?.activeAgentCallbacks.get(sequence)?.transientStubs;
-    if (!stubs || stubIndex >= stubs.length) {
-      throw new Error(
-          "This RPC stub has expired. It was a transient stub received as part of " +
-          "a agent callback, but the callback's RPC call has since ended, invalidating " +
-          "the stub.");
-    }
-    return stubs[stubIndex];
-  }
-
-  // Called by AgentSelfLoopback when any method is called on the `self` object.
+  // Called by AgentSelfLoopback when any method is called on the `self` object. Resolves once the
+  // call is queued for delivery; the agent handles it asynchronously and nothing is returned to
+  // the caller.
   async deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
-      initiatorUserId: string, initiatorModelId: string): Promise<unknown> {
+      initiatorUserId: string, initiatorModelId: string): Promise<void> {
     if (!this.ownerId) throw new Error("Workspace has been deleted.");
 
     // Compute the summary eagerly (it only reads, doesn't mutate or need the sequence).
@@ -7264,10 +7119,8 @@ class OverseerImpl implements AgentHooks {
 
     // Register this callback in the pending callbacks for the chat.
     let liveChat = this.#getLiveChat(chatId);
-    let promise = new Promise<unknown>((resolve, reject) => {
-      liveChat.pendingAgentCallbacks.push(
-          { methodName, args, argsSummary, initiatorUserId, initiatorModelId, resolve, reject });
-    });
+    liveChat.pendingAgentCallbacks.push(
+        { methodName, args, argsSummary, initiatorUserId, initiatorModelId });
 
     // If there's no active agent right now, go ahead and start one.
     //
@@ -7276,14 +7129,14 @@ class OverseerImpl implements AgentHooks {
     if (!meta.activeAgent && !this.isPreparingChatMessage(chatId)) {
       this.#startAgentForCallbacks(meta, liveChat);
     }
-
-    return promise;
   }
 
-  // Deliver one or more agent callbacks: append messages, start agent, wait for returns.
+  // Deliver one or more queued agent callbacks: append messages and start the agent. The callers
+  // were answered when their calls were queued, so any failure here is surfaced in the chat.
   async #startAgentForCallbacks(
       meta: AiChatMetadata | undefined, liveChat: LiveChatContext): Promise<void> {
     let callbacks = liveChat.pendingAgentCallbacks;
+    let author: AiChatAuthorInfo | undefined;
 
     try {
       if (callbacks.length === 0) {
@@ -7302,6 +7155,11 @@ class OverseerImpl implements AgentHooks {
       let user = this.users.get(this.users.idFromString(callbacks[0].initiatorUserId));
 
       let userMeta = await user.getChatContext(callbacks[0].initiatorModelId);
+      author = {
+        type: "gadget",
+        id: userMeta.profile.id,
+        name: this.storage.title.get(),
+      };
 
       if (!userMeta.aiModel) {
         throw new Error("No AI model configured for agent callback processing.");
@@ -7318,31 +7176,33 @@ class OverseerImpl implements AgentHooks {
       if (!meta) throw new Error("Chat thread was deleted before callback was handled.");
       if (meta.activeAgent) return;
 
-      let author: AiChatAuthorInfo = {
-        type: "gadget",
-        id: userMeta.profile.id,
-        name: this.storage.title.get(),
-      };
-
       // We're about to actually prcoess these callbacks into the message history, so we can now
       // remove them from the `LiveChatContext`. Any new callbacks queued after this point will
       // have to wait for the next round.
       liveChat.pendingAgentCallbacks = [];
 
+      let delivered = 0;
       for (let cb of callbacks) {
-        // Append the agentCallback message and get its sequence number.
         let sequence = this.nextChatSequence(chatId);
 
-        // Walk the args graph now that we know the sequence number (needed for
-        // TransientStubLoopback props).
-        let transientStubs: any[] = [];
-        let overseerId = this.ctx.id.toString();
-        let argsStorable = makeStorableArgs(
-            cb.args,
-            (stubIndex) => this.ctx.exports.TransientStubLoopback({props: {
-              overseerId, chatId, sequence, stubIndex,
-            }}),
-            transientStubs) as unknown[];
+        // Store the args in a separate table (not sent to clients). This goes first: the put
+        // serializes synchronously and throws if the args aren't storable -- in particular if
+        // they contain an RPC stub that isn't a persistent stub -- and then no agentCallback
+        // message is written for the call. The caller has already been answered, so the failure
+        // is reported in the chat instead.
+        try {
+          this.storage.agentCallbackArgs.put({
+            chatId,
+            sequence,
+            args: cb.args,
+          });
+        } catch (err) {
+          this.postAgentErrorMessage(chatId, author,
+              `Dropped callback \`${cb.methodName}()\`: its arguments could not be stored. ` +
+              `RPC stubs passed to an agent must be persistent stubs (created with ` +
+              `ctx.restore()). ${stringifyError(err)}`);
+          continue;
+        }
 
         this.storage.chats.put({
           chatId,
@@ -7354,22 +7214,9 @@ class OverseerImpl implements AgentHooks {
           methodName: cb.methodName,
           argsSummary: cb.argsSummary,
         });
-
-        // Store the storable args in a separate table (not sent to clients).
-        // TODO: Catch serialization errors and store an error stub instead?
-        this.storage.agentCallbackArgs.put({
-          chatId,
-          sequence,
-          args: argsStorable,
-        });
-
-        // Register this as an active agent callback with its transient stubs and return promise.
-        liveChat.activeAgentCallbacks.set(sequence, {
-          transientStubs,
-          resolve: cb.resolve,
-          reject: cb.reject,
-        });
+        delivered++;
       }
+      if (delivered === 0) return;
 
       // Start the agent.
       meta.activeAgent = userMeta.aiModel.profile;
@@ -7378,10 +7225,17 @@ class OverseerImpl implements AgentHooks {
       this.startAgent(chatId, userMeta.aiModel, author, callbacks[0].initiatorUserId,
                       /* callbackInitiated */ true);
     } catch (err) {
-      // Failure to set up the agent. Make sure to reject all callbacks.
+      // Failure to set up the agent. The queued callbacks are dropped; report that in the chat
+      // (when we got far enough to know who to attribute it to) and in the log.
       liveChat.pendingAgentCallbacks = [];
-      for (let cb of callbacks) {
-        cb.reject(err);
+      this.logger.error("failed to start agent for callbacks", {
+        event: "agent.callback.start.failed", error: err,
+        ...(meta ? {chatId: meta.id} : {}),
+      });
+      if (meta && author) {
+        let methods = callbacks.map(cb => `\`${cb.methodName}()\``).join(", ");
+        this.postAgentErrorMessage(meta.id, author,
+            `Failed to deliver callback(s) ${methods}: ${stringifyError(err)}`);
       }
     }
   }
@@ -7524,10 +7378,8 @@ class OverseerImpl implements AgentHooks {
   // which stays exact because every path that claims a new name dedupes against this set (or
   // against the live replay's scope), and thus can only claim names the simulation already
   // skipped. Kept in sync with the replay loop in runAgent (agent.ts). Callers that already hold
-  // the chat's messages may pass them to skip the listing; `callbackNamesOut`, when provided, is
-  // filled with each agentCallback message's allocated name, keyed by message sequence.
-  chatScopeNames(chatId: number, chatMessages?: Iterable<AiChatMessage>,
-                 callbackNamesOut?: Map<number, string>): Set<string> {
+  // the chat's messages may pass them to skip the listing.
+  chatScopeNames(chatId: number, chatMessages?: Iterable<AiChatMessage>): Set<string> {
     let context = this.getChatAgentContext(chatId);
     let taken: Set<string>;
     if (context.bindings) {
@@ -7576,7 +7428,6 @@ class OverseerImpl implements AgentHooks {
           name = `PARAMS_${++callbackNameCounter}`;
         } while (taken.has(name));
         taken.add(name);
-        callbackNamesOut?.set(msg.sequence, name);
       }
     }
     return taken;
@@ -8614,32 +8465,11 @@ class OverseerImpl implements AgentHooks {
         initiatorModelId,
       }});
 
-      // Build callback resolvers for any agent-callback bindings (env.PARAMS_<n>). Each resolver
-      // provides resolve() and reject() functions that the executed code can call to
-      // return a value or throw an error back to the callback's caller.
-      let callbackResolvers: Record<string,
-          {resolve: (v: unknown) => void, reject: (e: unknown) => void}> | undefined;
-      for (let [name, entry] of Object.entries(bindings)) {
-        if (entry.type === "value") {
-          callbackResolvers ??= {};
-          let sequence = entry.messageSequence;
-          callbackResolvers[name] = {
-            resolve: (value: unknown) => {
-              this.resolveAgentCallback(chatId, sequence, value);
-            },
-            reject: (error: unknown) => {
-              this.rejectAgentCallback(chatId, sequence, error);
-            },
-          };
-        }
-      }
-
       let error: string | undefined;
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, callbackResolvers,
-            new RestoreForgerImpl(this, chatId, bindings));
+        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -10156,17 +9986,9 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   /** Called by AgentSelfLoopback when any method is called on the `self` object. */
   deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
-      initiatorUserId: string, initiatorModelId: string): Promise<unknown> {
+      initiatorUserId: string, initiatorModelId: string): Promise<void> {
     return this.impl.deliverAgentCallback(
         chatId, methodName, args, initiatorUserId, initiatorModelId);
-  }
-
-  /** Called by TransientStubLoopback to retrieve a live transient RPC stub. */
-  getTransientStub(chatId: number, sequence: number, stubIndex: number): any {
-    // TODO: The workaround of wrapping in NativeRpcStub is needed because the runtime
-    //   doesn't pipeline through Proxy objects properly. But here we're returning an
-    //   arbitrary stub, not a known RpcTarget. Returning `any` for now.
-    return this.impl.getTransientStub(chatId, sequence, stubIndex);
   }
 
   async spawnAgent(
@@ -10370,8 +10192,10 @@ type AgentSelfLoopbackProps = {
 /**
  * The `self` magic object passed to code executed via the agent's `executeCode` tool.
  * Calling any method on it (e.g., self.foo(123)) delivers a callback message to the chat
- * thread and activates the agent to respond. This is a WorkerEntrypoint so it produces a
- * Fetcher that can be passed over RPC and stored in Durable Object KV storage.
+ * thread and activates the agent to respond. The call resolves once the callback is queued and
+ * returns nothing; the arguments must be storable (any RPC stubs among them must be persistent
+ * stubs). This is a WorkerEntrypoint so it produces a Fetcher that can be passed over RPC and
+ * stored in Durable Object KV storage.
  * TODO: Would be awesome if the agent could pass a sub-object like `self.foo`, and then be told
  *   later e.g. "foo.callback() was called". This requires that we implement RpcPromise
  *   serializability in the built-in RPC system, matching Cap'n Web.
@@ -10393,48 +10217,6 @@ export class AgentSelfLoopback
           return stub.deliverAgentCallback(
               chatId, String(prop), args, initiatorUserId, initiatorModelId);
         };
-      },
-      getPrototypeOf(target) {
-        return WorkerEntrypoint.prototype;
-      },
-    });
-  }
-
-  /**
-   * We need to declare a method otherwise the validator won't even report this class as existing
-   * and so the loopback binding won't be created.
-   */
-  dummyMethodToWorkAroundValidatorBug() {}
-}
-
-type TransientStubLoopbackProps = {
-  overseerId: string;
-  chatId: number;
-  sequence: number;   // message sequence number of the agentCallback message
-  stubIndex: number;  // index into the transient stubs table for that message
-};
-
-/**
- * Loopback entrypoint that proxies to a transient RPC stub from a agent callback's arguments.
- * When the callback args are stored, each transient NativeRpcStub is replaced with one of
- * these. It forwards all method calls to the live stub (looked up from the Overseer's
- * in-memory table). If the stub has expired (the deliverAgentCallback RPC ended), calls will
- * throw.
- */
-export class TransientStubLoopback
-    extends WorkerEntrypoint<Cloudflare.Env, TransientStubLoopbackProps> {
-  constructor(ctx: ExecutionContext<TransientStubLoopbackProps>, env: Cloudflare.Env) {
-    super(ctx, env);
-
-    let ns = ctx.exports.OverseerDurableObject;
-    let stub: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(ctx.props.overseerId));
-    let target = stub.getTransientStub(
-        ctx.props.chatId, ctx.props.sequence, ctx.props.stubIndex);
-
-    return new Proxy<TransientStubLoopback>(<any>target, {
-      get(target, prop, receiver) {
-        return Reflect.get(target, prop, target);
       },
       getPrototypeOf(target) {
         return WorkerEntrypoint.prototype;
