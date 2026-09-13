@@ -12,8 +12,9 @@ import { describe, expect, it } from "vitest";
 import { env, RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { keyString } from "@gadgets/typed-storage";
-import type { AiChatAuthorInfo, AiChatMessage } from "@gadgets/workshop-shared/api";
+import type { AgentSpawnerConfig, AiChatAuthorInfo, AiChatMessage } from "@gadgets/workshop-shared/api";
 import type { OverseerDurableObject } from "../src/overseer.js";
+import type { AgentSpawnerBinding } from "../src/agent-spawner-binding";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -102,6 +103,27 @@ async function waitFor(cond: () => boolean): Promise<void> {
 
 function deliver(impl: any, method: string, args: unknown[], modelId: string | null = "m") {
   return impl.deliverAgentCallback(CHAT_ID, method, args, OWNER_USER_ID, modelId);
+}
+
+function callbackNames(impl: any): [string, string | undefined][] {
+  return messages(impl).flatMap(msg =>
+      msg.type === "agentCallback" ? [[msg.methodName, msg.bindingName]] : []);
+}
+
+const SPAWNER_CONFIG: AgentSpawnerConfig = { displayName: "Spawner", modelId: "m", env: {} };
+const SPAWNER_TYPES = {
+  types: "/** Drafts replies. */\ninterface Drafter { composeEmail(to: string): void; }",
+  mainType: "Drafter",
+};
+
+// The binding a gadget holds, as the gadget would reach it: the spawner gatekeeper instantiated
+// as one of this overseer's facets (the only way to reach a DurableObject class carrying props),
+// then its session. Calls made through it go over RPC back into the overseer.
+async function spawnerBinding(impl: any, config = SPAWNER_CONFIG): Promise<AgentSpawnerBinding> {
+  let cls = impl.ctx.exports.AgentSpawnerGatekeeper({ props: {
+    overseerId: impl.ctx.id.toString(), config, creatorUserId: OWNER_USER_ID,
+  } });
+  return impl.getGatekeeperFacet(900, cls).startSession(undefined);
 }
 
 describe("durable agent calls", () => {
@@ -468,6 +490,125 @@ describe("durable agent calls", () => {
     await waitFor(() => pendingCalls(impl).length === 0);
     // Delivered with no turn to start (no model), so nothing needs a wake-up any more.
     expect(await impl.ctx.storage.getAlarm()).toBeNull();
+  }));
+
+  it("a delivered call's arguments are bound under <method>_ARGS, suffixed on collision",
+      () => freshImpl(async impl => {
+    seedChat(impl);
+    let release = gatedFakeUsers(impl);
+    // A seed binding already holds the first name `report` would get.
+    impl.storage.chatContext.put({ chatId: CHAT_ID, bindings: { report_ARGS: 5 } });
+
+    // All recorded before the drain gets to its lookup, so one batch names them all. (No model,
+    // so no turn starts and the chat is idle again for the second drain below.)
+    await deliver(impl, "composeEmail", ["a@example.com"], null);
+    await deliver(impl, "composeEmail", ["b@example.com"], null);
+    await deliver(impl, "report", [], null);
+    await deliver(impl, "foo-bar", [], null);  // not an identifier
+    await deliver(impl, "foo-baz", [], null);
+    release();
+    await waitFor(() => pendingCalls(impl).length === 0);
+
+    expect(callbackNames(impl)).toEqual([
+      ["composeEmail", "composeEmail_ARGS"],
+      ["composeEmail", "composeEmail_ARGS_2"],
+      ["report", "report_ARGS_2"],
+      ["foo-bar", "CALL_ARGS"],
+      ["foo-baz", "CALL_ARGS_2"],
+    ]);
+    // The names are in the chat's scope from now on, so a later drain keeps suffixing...
+    expect(impl.chatScopeNames(CHAT_ID)).toEqual(new Set([
+      "report_ARGS", "composeEmail_ARGS", "composeEmail_ARGS_2", "report_ARGS_2",
+      "CALL_ARGS", "CALL_ARGS_2",
+    ]));
+    await deliver(impl, "composeEmail", [], null);
+    await waitFor(() => pendingCalls(impl).length === 0);
+    expect(callbackNames(impl).at(-1)).toEqual(["composeEmail", "composeEmail_ARGS_3"]);
+  }));
+
+  it("a callback from before durable calls binds nothing", () => freshImpl(async impl => {
+    seedChat(impl);
+    fakeUsers(impl);
+    // Its arguments were transient and are gone; the message stays in the log for display.
+    impl.storage.chats.put({
+      chatId: CHAT_ID, sequence: impl.nextChatSequence(CHAT_ID), timestamp: new Date(0),
+      author: OWNER, type: "agentCallback", methodName: "legacy", argsSummary: "[0]: 1",
+    });
+    expect(impl.chatScopeNames(CHAT_ID)).toEqual(new Set());
+
+    // Nor does it take part in naming: a new call to the same method gets the unsuffixed name.
+    await deliver(impl, "legacy", [2], null);
+    await waitFor(() => pendingCalls(impl).length === 0);
+    expect(callbackNames(impl)).toEqual([["legacy", undefined], ["legacy", "legacy_ARGS"]]);
+  }));
+
+  it("spawnCallable(title, prompt) is refused with the migration message",
+      () => freshImpl(async impl => {
+    impl.ownerId = OWNER_USER_ID;
+    fakeUsers(impl);
+    let binding = await spawnerBinding(impl);
+
+    let outcome = "ok";
+    try {
+      await (binding as any).spawnCallable("Drafts", "You draft emails.");
+    } catch (err) {
+      outcome = (err as Error).message;
+    }
+    expect(outcome).toMatch(/replaced by spawnCallable\(title, \{types, mainType\}\)/);
+    expect([...impl.storage.chatMeta.list()]).toEqual([]);
+  }));
+
+  // The stub spawnCallable() returns is an AgentSelfLoopback, whose every method is a Proxy trap
+  // that forwards to deliverAgentCallback. The test pool's RPC emulation resolves methods on the
+  // class prototype only, so calls through the stub can't be exercised here; these tests deliver
+  // to the spawned chat the way the stub does.
+  it("spawnCallable() creates an empty chat, which the first call starts",
+      () => freshImpl(async impl => {
+    impl.ownerId = OWNER_USER_ID;
+    fakeUsers(impl);
+    let started: unknown[][] = [];
+    impl.startAgent = (...args: unknown[]) => { started.push(args); };
+    let binding = await spawnerBinding(impl);
+
+    let agent = await binding.spawnCallable("Drafts", SPAWNER_TYPES);
+    expect(agent).toBeDefined();
+
+    // The chat exists, idle, with the declarations frozen on its context and no prompt message.
+    let [meta] = [...impl.storage.chatMeta.list()];
+    expect(meta).toMatchObject({ title: "Drafts", spawnerName: "Spawner" });
+    expect(meta.activeAgent).toBeUndefined();
+    expect(impl.storage.chatContext.get(meta.id)).toEqual({
+      chatId: meta.id, spawnerConfig: SPAWNER_CONFIG, spawnerTypes: SPAWNER_TYPES, bindings: {},
+    });
+    expect([...impl.storage.chats.list()]).toEqual([]);
+    expect(started).toEqual([]);
+
+    // The call resolves once recorded; the drain then appends it and starts the agent.
+    await impl.deliverAgentCallback(meta.id, "composeEmail", ["a@example.com"], OWNER_USER_ID, "m");
+    await waitFor(() => started.length > 0);
+    expect([...impl.storage.chats.list()]).toMatchObject([{
+      chatId: meta.id, type: "agentCallback", methodName: "composeEmail",
+      argsSummary: '[0]: "a@example.com"', bindingName: "composeEmail_ARGS",
+    }]);
+    expect(started[0].slice(0, 4)).toEqual([
+      meta.id, { profile: MODEL, config: BROKEN_MODEL_CONFIG },
+      { type: "gadget", id: OWNER.id, name: impl.storage.title.get() }, OWNER_USER_ID,
+    ]);
+  }));
+
+  it("spawnCallable() with no model still records calls, for a human", () => freshImpl(async impl => {
+    impl.ownerId = OWNER_USER_ID;
+    fakeUsers(impl);
+    impl.startAgent = () => { throw new Error("must not start"); };
+    let binding = await spawnerBinding(impl, { ...SPAWNER_CONFIG, modelId: null });
+
+    await binding.spawnCallable("Drafts", SPAWNER_TYPES);
+    let [meta] = [...impl.storage.chatMeta.list()];
+    await impl.deliverAgentCallback(meta.id, "composeEmail", ["a@example.com"], OWNER_USER_ID, null);
+    await waitFor(() => pendingCalls(impl).length === 0);
+
+    expect(callbackNames(impl)).toEqual([["composeEmail", "composeEmail_ARGS"]]);
+    expect(impl.storage.chatMeta.get(meta.id).activeAgent).toBeUndefined();
   }));
 
   it("calls recorded before a restart are delivered when the DO is next constructed", async () => {

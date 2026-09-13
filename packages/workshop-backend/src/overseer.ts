@@ -40,7 +40,7 @@ import { ambientGatekeeperMode } from "./provisioning-policy";
 import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
 import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
-import { AgentSpawnerBinding } from "./agent-spawner-binding";
+import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
@@ -463,6 +463,26 @@ function fallbackBindingName(base: string, isTaken: (name: string) => boolean): 
     }
     candidate = `${sanitized}_${i}`;
   }
+}
+
+// The env name under which a call's arguments are delivered to a callable agent:
+// `<method>_ARGS`, or `CALL_ARGS` when the method name isn't an identifier (e.g. "foo-bar"), in
+// either case suffixed _2/_3/... until it isn't taken. Stamped on the agentCallback message when
+// the call is appended to the log (see drainPendingAgentCalls); the `_ARGS` suffix keeps it from
+// colliding with a reserved word or an Object.prototype member, so only the identifier check can
+// fail.
+function callArgsBindingName(methodName: string, isTaken: (name: string) => boolean): string {
+  let base = `${methodName}_ARGS`;
+  try {
+    validateBindingName(base);
+  } catch {
+    base = "CALL_ARGS";
+  }
+  let candidate = base;
+  for (let i = 2; isTaken(candidate); i++) {
+    candidate = `${base}_${i}`;
+  }
+  return candidate;
 }
 
 function observerVendorId(record: GatekeeperRecord): string | null {
@@ -7317,11 +7337,15 @@ class OverseerImpl implements AgentHooks {
 
       // Move every recorded call into the chat log. No awaits from here to the turn start, so a
       // crash cannot leave a call half-delivered, and a call recorded after this point waits for
-      // the turn to end.
+      // the turn to end. Each call's arguments get an env name, unique in the chat's scope as of
+      // this point in the log, stamped on the message like capsule binding names are.
       let initiatorUserId = first.initiatorUserId;
+      let taken = this.chatScopeNames(chatId);
       for (let call of Array.from(this.storage.pendingAgentCalls.list(
           {prefix: `${keyString(chatId)}.`}))) {
         let sequence = this.nextChatSequence(chatId);
+        let bindingName = callArgsBindingName(call.methodName, name => taken.has(name));
+        taken.add(bindingName);
         // The args go in a separate table (not sent to clients); they were already proven
         // storable when they were recorded.
         this.storage.agentCallbackArgs.put({ chatId, sequence, args: call.args });
@@ -7334,6 +7358,7 @@ class OverseerImpl implements AgentHooks {
           type: "agentCallback",
           methodName: call.methodName,
           argsSummary: call.argsSummary,
+          bindingName,
         });
         this.storage.pendingAgentCalls.delete(
             `${keyString(call.chatId)}.${keyString(call.callId)}`);
@@ -7505,14 +7530,10 @@ class OverseerImpl implements AgentHooks {
 
   // Every binding name currently claimed in the given chat's scope: the frozen seed layer (or,
   // for a chat that hasn't been seeded yet, the prospective seed it would freeze -- see
-  // prepareChatBindings), the names recorded on log messages (pasted resources, live connection
-  // requests, created gadgets), and the PARAMS_<n> names of agent callbacks. Callback names
-  // aren't stored anywhere; the replay loop in runAgent (agent.ts) allocates them in log order,
-  // skipping names already in scope, so this method simulates the same ordered allocation --
-  // which stays exact because every path that claims a new name dedupes against this set (or
-  // against the live replay's scope), and thus can only claim names the simulation already
-  // skipped. Kept in sync with the replay loop in runAgent (agent.ts). Callers that already hold
-  // the chat's messages may pass them to skip the listing.
+  // prepareChatBindings) and the names recorded on log messages (pasted resources, live
+  // connection requests, created gadgets, the arguments of delivered agent calls). Every name is
+  // stamped on its message when it is claimed, so this is a plain scan. Callers that already
+  // hold the chat's messages may pass them to skip the listing.
   chatScopeNames(chatId: number, chatMessages?: Iterable<AiChatMessage>): Set<string> {
     let context = this.getChatAgentContext(chatId);
     let taken: Set<string>;
@@ -7530,7 +7551,6 @@ class OverseerImpl implements AgentHooks {
       // meaning "unrestricted"): the workspace default binding list.
       taken = new Set(Object.keys(this.defaultBindingList()));
     }
-    let callbackNameCounter = 0;
     for (let msg of chatMessages ?? this.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
       if (msg.type === "message") {
         for (let capsule of msg.capsules ?? []) {
@@ -7554,14 +7574,8 @@ class OverseerImpl implements AgentHooks {
           taken.add(created.bindingName);
         }
       } else if (msg.type === "agentCallback") {
-        // Allocate the callback's PARAMS_<n> name exactly as the replay loop does: n increments
-        // per agentCallback message in log order, skipping names already taken at this point in
-        // the log. (This is why the loop processes messages in log order.)
-        let name: string;
-        do {
-          name = `PARAMS_${++callbackNameCounter}`;
-        } while (taken.has(name));
-        taken.add(name);
+        // Absent on a message from before durable calls, which binds nothing.
+        if (msg.bindingName !== undefined) taken.add(msg.bindingName);
       }
     }
     return taken;
@@ -7709,13 +7723,11 @@ class OverseerImpl implements AgentHooks {
 
     // --- The naming chokepoint: stamp binding names onto persisted messages that lack them. ---
     // First collect every name already in the chat's scope (and a target -> name map for reuse)
-    // from the seed plus the log -- including the callback PARAMS_<n> names the replay loop will
-    // allocate, simulated the same way, so a minted name can't collide with anything replay will
-    // bind -- then name and stamp the unnamed, in log order. We scan and stamp the caller's
-    // in-memory message objects (not a fresh storage listing, which would deserialize separate
-    // copies): the caller replays these same objects right after we return, and must see the
-    // names we stamp. (This scan can't reuse chatScopeNames: that method rereads the chat context
-    // from storage, where a seed map created just above isn't persisted yet.)
+    // from the seed plus the log, then name and stamp the unnamed, in log order. We scan and
+    // stamp the caller's in-memory message objects (not a fresh storage listing, which would
+    // deserialize separate copies): the caller replays these same objects right after we return,
+    // and must see the names we stamp. (This scan can't reuse chatScopeNames: that method rereads
+    // the chat context from storage, where a seed map created just above isn't persisted yet.)
     // TODO: The logic here is replaying the chat message log to regenerate the binding map.
     //   Could this logic be incorporated into the chat log replay that happens inside runAgent(),
     //   in agent.ts? It feels similar, and it would be nice to consolidate all "tool call replay"
@@ -7739,7 +7751,6 @@ class OverseerImpl implements AgentHooks {
     }
     let namingLog = chatMessages;
     let anythingToName = false;
-    let callbackNameCounter = 0;
     for (let msg of namingLog) {
       if (msg.type === "message") {
         for (let capsule of msg.capsules ?? []) {
@@ -7788,13 +7799,7 @@ class OverseerImpl implements AgentHooks {
           }
         }
       } else if (msg.type === "agentCallback") {
-        // Claim the PARAMS_<n> name the replay loop will allocate for this callback (kept in
-        // sync with runAgent in agent.ts and with chatScopeNames).
-        let name: string;
-        do {
-          name = `PARAMS_${++callbackNameCounter}`;
-        } while (taken.has(name));
-        taken.add(name);
+        if (msg.bindingName !== undefined) taken.add(msg.bindingName);
       }
     }
 
@@ -10127,14 +10132,70 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         chatId, methodName, args, initiatorUserId, initiatorModelId);
   }
 
+  /** Implements AgentSpawnerBinding.spawn(): the agent starts at once on `prompt`. */
   async spawnAgent(
       title: string, prompt: string, config: AgentSpawnerConfig,
-      creatorUserId?: string, callable?: boolean) {
+      creatorUserId?: string): Promise<void> {
+    let {chatId, meta, userMeta, author, initiatorUserId} =
+        await this.#createSpawnedChat(title, config, creatorUserId);
+
+    if (userMeta.aiModel) {
+      meta.activeAgent = userMeta.aiModel.profile;
+      this.impl.storage.chatMeta.put(meta);
+    }
+
+    this.impl.storage.chats.put({
+      chatId,
+      sequence: this.impl.nextChatSequence(chatId),
+      timestamp: meta.started,
+      author,
+
+      type: "message",
+      message: prompt,
+    });
+
+    if (userMeta.aiModel) {
+      // Fire off the agent (asynchronously).
+      this.impl.startAgent(chatId, userMeta.aiModel, author, initiatorUserId);
+    } else {
+      // TODO: Flag as needing user attention.
+    }
+  }
+
+  /**
+   * Implements AgentSpawnerBinding.spawnCallable(): the chat is created with no messages, and
+   * the agent starts when the first call is made on the returned stub. The declarations the agent
+   * implements are frozen on the chat context, where the system-prompt builder reads them.
+   */
+  async spawnCallableAgent(
+      title: string, options: SpawnCallableOptions, config: AgentSpawnerConfig,
+      creatorUserId?: string): Promise<CallableAgent> {
+    let {chatId, initiatorUserId} =
+        await this.#createSpawnedChat(title, config, creatorUserId, options);
+
+    // A stub that delivers calls to the new chat thread, like the `self` magic object. Each call
+    // is recorded by deliverAgentCallback(), which starts the agent when it is idle; with no
+    // model configured, calls are still appended to the chat, for a human to pick up.
+    return this.impl.ctx.exports.AgentSelfLoopback({props: {
+      overseerId: this.impl.ctx.id.toString(),
+      chatId,
+      initiatorUserId,
+      initiatorModelId: config.modelId,
+    }}) as unknown as CallableAgent;
+  }
+
+  // Creates the chat for a spawned agent: its metadata, and a context carrying the frozen spawner
+  // config (plus, for a callable agent, the interface declarations) and the seed binding layer.
+  // Writes no messages; the caller decides how the chat starts.
+  async #createSpawnedChat(
+      title: string, config: AgentSpawnerConfig, creatorUserId: string | undefined,
+      spawnerTypes?: SpawnCallableOptions) {
     if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
 
     // Resolve the model from the creating user's account (falls back to owner for
     // bindings created before collaborator support).
     let resolveUserId = creatorUserId ?? this.impl.ownerId;
+    let initiatorUserId = this.impl.users.idFromString(resolveUserId).toString();
     let user = this.impl.users.get(this.impl.users.idFromString(resolveUserId));
     let userMeta = await user.getChatContext(config.modelId);
 
@@ -10147,9 +10208,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       lastActive: timestamp,
       spawnerName: config.displayName,
     };
-    if (!callable && userMeta.aiModel) {
-      meta.activeAgent = userMeta.aiModel.profile;
-    }
     this.impl.storage.chatMeta.put(meta);
 
     // Snapshot the spawner's configured bindings as the chat's seed binding layer -- the spawned
@@ -10163,45 +10221,16 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
 
-    this.impl.storage.chatContext.put({
-      chatId,
-      spawnerConfig: config,
-      bindings,
-    });
+    let context: AiChatAgentContext = {chatId, spawnerConfig: config, bindings};
+    if (spawnerTypes) context.spawnerTypes = spawnerTypes;
+    this.impl.storage.chatContext.put(context);
 
     let author: AiChatAuthorInfo = {
       type: "gadget",
       id: userMeta.profile.id,
       name: this.impl.storage.title.get(),
     };
-
-    this.impl.storage.chats.put({
-      chatId,
-      sequence: this.impl.nextChatSequence(chatId),  // always 0 but need to initialize
-      timestamp,
-      author,
-
-      type: "message",
-      message: prompt,
-    });
-
-    if (callable) {
-      // Return a stub that delivers calls to the new chat thread, like the `self` magic object.
-      // The agent will be started on first call via deliverAgentCallback(). With no model
-      // configured, calls are still appended to the chat, for a human to pick up.
-      return this.impl.ctx.exports.AgentSelfLoopback({props: {
-        overseerId: this.impl.ctx.id.toString(),
-        chatId,
-        initiatorUserId: this.impl.users.idFromString(resolveUserId).toString(),
-        initiatorModelId: config.modelId,
-      }}) as any;
-    } else if (userMeta.aiModel) {
-      // Fire off the agent (asynchronously).
-      this.impl.startAgent(chatId, userMeta.aiModel, author,
-                           this.impl.users.idFromString(resolveUserId).toString());
-    } else {
-      // TODO: Flag as needing user attention.
-    }
+    return {chatId, meta, userMeta, author, initiatorUserId};
   }
 
   [restore](params: OverseerRestoreParams): any {
@@ -12932,8 +12961,12 @@ export class AgentSpawnerGatekeeper
   }
 }
 
+// Deliberately not `implements AgentSpawnerBinding`: capnweb-validate sharpens an implemented
+// interface's signatures onto the generated validator, which would reject the string that the
+// migration guard in spawnCallable exists to explain. Conformance to the served interface is
+// still checked, by startSession()'s return type.
 @validateRpc()
-class AgentSpawnerBindingImpl extends RpcTarget implements AgentSpawnerBinding {
+class AgentSpawnerBindingImpl extends RpcTarget {
   constructor(private ctx: DurableObjectState<AgentSpawnerBindingProps>) {
     super();
   }
@@ -12952,8 +12985,19 @@ class AgentSpawnerBindingImpl extends RpcTarget implements AgentSpawnerBinding {
         title, prompt, this.ctx.props.config, this.ctx.props.creatorUserId);
   }
 
-  async spawnCallable(title: string, prompt: string): Promise<Fetcher<any>> {
-    return this.#getOverseer().spawnAgent(
-        title, prompt, this.ctx.props.config, this.ctx.props.creatorUserId, true);
+  // Migration guard: `options` admits a string only so that a gadget written against the old
+  // spawnCallable(title, prompt) fails with an explanation rather than a validator type error.
+  // The served .d.ts keeps the clean signature. Remove once existing gadgets have been updated.
+  async spawnCallable(title: string, options: SpawnCallableOptions | string)
+      : Promise<CallableAgent> {
+    if (typeof options === "string") {
+      throw new Error(
+          "spawnCallable(title, prompt) has been replaced by spawnCallable(title, " +
+          "{types, mainType}); the agent no longer receives a prompt and calls no longer return " +
+          "values. Update the calling code -- call describeBinding on the spawner for the new " +
+          "interface.");
+    }
+    return this.#getOverseer().spawnCallableAgent(
+        title, options, this.ctx.props.config, this.ctx.props.creatorUserId);
   }
 }

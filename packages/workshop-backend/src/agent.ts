@@ -17,6 +17,7 @@ import { webFetch as webFetchImpl, WebFetchEnv, formatWebFetchResult } from "./w
 import { AgentCatalogSnapshot, formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
+import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
 import {
@@ -149,6 +150,14 @@ export type AiChatAgentContext = {
    * time.
    */
   spawnerConfig?: AgentSpawnerConfig;
+
+  /**
+   * If present, this chat was spawned with `spawnCallable()`, and these are the TypeScript
+   * declarations of the interface the agent implements, frozen at spawn time like
+   * `spawnerConfig`. Kept here rather than in the chat log so the system-prompt builder can read
+   * them without a log scan and they don't render in the chat.
+   */
+  spawnerTypes?: SpawnCallableOptions;
 
   /**
    * Initial `env` binding set gathered when this chat was started, typically including all gadgets
@@ -329,8 +338,8 @@ async function resolveBindingDescription(
     case "workpiece":
       return hooks.describeBinding(`env.${name}`, entry.id);
     case "value":
-      return `env.${name} is the arguments array of an agent callback (one element per ` +
-          `parameter of the call).`;
+      return `env.${name} is the arguments array of a call delivered to this agent (one element ` +
+          `per parameter of the call). Any RPC stubs among them may be called directly.`;
     default:
       return entry satisfies never;
   }
@@ -879,10 +888,28 @@ You are an AI agent started to perform a specific task as part of a personal app
 
 Gadgets execute on a restricted and heavily-sandboxed variant of Cloudflare Workers.
 
-You were started programmatically by the Gadget to perform a task. The specific task will be described in the first message in this chat. The message is not directly from the user but rather from an automated system. If you receive any further messages after the first, then these additional messages are directly from a human user making additional requests regarding the task.
+You were started programmatically by the Gadget to perform a task, described below.
 
 Typically (but not always), you will need to use the \`executeCode\` tool to complete the task, invoking the available bindings (members of the env object) and other APIs available to you.
 `.trim();
+
+// How the task reaches an agent spawned with spawn(): as the chat's first message.
+let SPAWNED_TASK_PROMPT = `
+The specific task is described in the first message in this chat. That message is not directly from the user but rather from an automated system. Any further messages after the first are directly from a human user making additional requests regarding the task.
+`.trim();
+
+// How the task reaches an agent spawned with spawnCallable(): as calls on an interface the agent
+// implements. The kernel explains how calls are delivered, and embeds the gadget-supplied
+// declarations verbatim.
+function formatCallableAgentPrompt({types, mainType}: SpawnCallableOptions): string {
+  return `
+The Gadget expects you to implement the TypeScript interface \`${mainType}\`, declared below. Each time it calls a method of \`${mainType}\`, you will receive the call as a message, and the parameters to the call will be placed into your \`env\` for use in \`executeCode\`, under the name given in that message. Complete the task as described in the interface's doc comments. Calls return nothing to the caller: the only effect you have is through the capabilities available to you, including any RPC stubs passed as parameters. Any message in this chat that is not such a call is directly from a human user making additional requests regarding the task.
+
+\`\`\`ts
+${types.trim()}
+\`\`\`
+`.trim();
+}
 
 let READ_FILE_TOOL_DESCRIPTION = `
 Read the content of a file owned by one of the workspace's gadgets. If a file changes after you read it, you will either be informed of the change or the outdated result will be replaced with a note telling you to re-read the file; otherwise there is no need to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.
@@ -972,7 +999,7 @@ Note that this differs from the \`env\` a Gadget's own code sees: a Gadget's ser
 
 When the user asks you to just do a task that can be done with these bindings, you should use executeCode to perform the task, instead of adding code to a gadget to do it.
 
-The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, delivers a callback message to this chat and activates you to respond. The call itself returns immediately once you've been activated; it doesn't wait for you. The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When an agent callback is received, its arguments appear in your env as an array, under a name like \`PARAMS_1\` given in the callback message.
+The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, records a callback to this chat, which is delivered to you as a message on a later turn and activates you to respond. The call resolves as soon as the callback is recorded and returns nothing; it never waits for you (so awaiting it within the same executeCode run is fine, but it cannot yield a result). The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When a callback is received, its arguments appear in your env as an array, under a name like \`foo_ARGS\` given in the callback message.
 `.trim();
 
 let LIST_CONNECTABLE_RESOURCES_TOOL_DESCRIPTION = `
@@ -1538,6 +1565,8 @@ export async function runAgent(
       chatBindings.set(seed.name, {type: "workpiece", id: seed.target});
     }
   }
+  // Read after prepareChatBindings, which seeds (and persists) the context on first use.
+  let agentContext = hooks.getChatAgentContext(chatId);
 
   // Always-available resources (e.g. the Context Library) describe the agent's environment, so
   // they're announced in the system prompt (slot 1, below) alongside the bindings list rather
@@ -1547,12 +1576,6 @@ export async function runAgent(
       ? formatAlwaysAvailableResourcesPrompt(alwaysAvailable.map(seed =>
           ({title: seed.title, name: seed.name, catalog: seed.catalog!})))
       : "";
-
-  // Agent-callback bindings are named PARAMS_1, PARAMS_2, ... in replay order, skipping any name
-  // already taken in scope. This is the authoritative allocation; chatScopeNames and the naming
-  // chokepoint in overseer.ts simulate it (so name-choosing paths there can't claim a name a
-  // callback holds) -- keep them in sync.
-  let callbackNameCounter = 0;
 
   // Rebuild the code the compacted prefix left behind: first the checkpoint's pins establish
   // their base trees, then the composed proposed change applies on top. (A pre-conversion
@@ -2113,19 +2136,25 @@ export async function runAgent(
       }
 
       case "agentCallback": {
-        // Assign a binding name for this callback's args: PARAMS_<n>, deterministic from replay
-        // order, skipping names already taken in scope (kept in sync with the simulations in
-        // overseer.ts -- see chatScopeNames).
-        let name: string;
-        do {
-          name = `PARAMS_${++callbackNameCounter}`;
-        } while (isNameInScope(name));
-        chatBindings.set(name, { type: "value", messageSequence: msg.sequence });
-
-        let content =
-            `A callback was received: \`self.${msg.methodName}()\`\n\n` +
-            `Arguments (env.${name}):\n${msg.argsSummary}\n\n` +
-            `Access the full arguments as \`env.${name}\` (an array) in executeCode.`;
+        // The args binding name was stamped on the message when the call was appended to the log
+        // (drainPendingAgentCalls in overseer.ts), unique in the chat's scope at that point. A
+        // message without one predates durable calls: its arguments were transient and are gone.
+        let name = msg.bindingName;
+        let content: string;
+        if (name === undefined) {
+          content =
+              `A callback was received: \`self.${msg.methodName}()\`. ` +
+              `Its arguments are no longer available.`;
+        } else {
+          chatBindings.set(name, { type: "value", messageSequence: msg.sequence });
+          let call = agentContext.spawnerTypes
+              ? `The Gadget called \`${msg.methodName}()\` on your interface.`
+              : `A callback was received: \`self.${msg.methodName}()\`.`;
+          content =
+              `${call} Arguments (\`env.${name}\`):\n${msg.argsSummary}\n\n` +
+              `Access the full arguments as \`env.${name}\` (an array, one element per ` +
+              `parameter) in executeCode.`;
+        }
 
         modelMessages.push({ role: "user", content, timestamp: msgTimestamp });
         break;
@@ -2313,7 +2342,6 @@ export async function runAgent(
         pendingWorktreeCommits.push({worktreeId: id, commit, previousHead}),
   };
 
-  let agentContext = hooks.getChatAgentContext(chatId);
   let emitStreamEvent = (event: AiChatStreamEvent) => {
     hooks.emitChatStreamEvent(chatId, event);
   };
@@ -2361,14 +2389,20 @@ export async function runAgent(
           `You have access to the following bindings via the \`env\` object:\n${lines.join("\n")}`;
     }
 
-    // Split the system prompt into static and dynamic parts for better caching.
+    // Split the system prompt into static and dynamic parts for better caching. How the task is
+    // delivered depends on how the chat was spawned, and for a callable agent includes the
+    // chat-specific (but stable across the chat) interface, so that goes in the second slot.
     systemPromptSlots = [
       instanceInstructions
           ? `${SPAWNER_SYSTEM_PROMPT}\n\n${instanceInstructions}`
           : SPAWNER_SYSTEM_PROMPT,
-      alwaysAvailableResourcesPrompt
-          ? `${systemPromptBindings}\n\n${alwaysAvailableResourcesPrompt}`
-          : systemPromptBindings,
+      [
+        agentContext.spawnerTypes
+            ? formatCallableAgentPrompt(agentContext.spawnerTypes)
+            : SPAWNED_TASK_PROMPT,
+        systemPromptBindings,
+        alwaysAvailableResourcesPrompt,
+      ].filter(part => part !== "").join("\n\n"),
     ];
   } else {
     // This is a regular coding agent.

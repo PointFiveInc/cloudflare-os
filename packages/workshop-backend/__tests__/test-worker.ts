@@ -9,6 +9,11 @@ import { LoginConnectCallbackImpl } from "../src/auth/login-flow.js";
 export * from "../src/server.js";
 export { default } from "../src/server.js";
 /**
+ * The `self` object / spawnCallable() stub entrypoint, named explicitly for the same reason as the
+ * callbacks below: the overseer mints it through `ctx.exports.AgentSelfLoopback({props})`.
+ */
+export { AgentSelfLoopback } from "../src/server.js";
+/**
  * The Workshop's connect callback, reachable through `ctx.exports`: the pool derives those from this
  * module's own declarations, so an entrypoint a test reaches that way has to be named here rather
  * than covered by the `export *`.
