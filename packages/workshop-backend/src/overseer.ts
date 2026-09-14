@@ -5019,20 +5019,42 @@ class OverseerImpl implements AgentHooks {
   //
   // If `chatId` is specified, load the gadget including changes proposed in the given chat
   // thread.
-  getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number): Fetcher<DurableObject> {
-    this.getGadgetRecord(gadgetId);  // validate it exists
+  //
+  // The stub is minted through our own ctx.restore() rather than taken from ctx.facets.get()
+  // directly: the runtime only lets a facet call *its* ctx.restore() when the request reached it
+  // through a stub the parent created with ctx.restore() (that stub is what tells the runtime how
+  // to recreate the facet). A bare facet stub carries no such context, so gadget code calling
+  // `this.ctx.restore()` -- to hand a persistent callback to a spawned agent or a hook -- would
+  // throw. Every stub to a gadget facet therefore comes from here; only [restore]() itself, which
+  // is what ctx.restore() invokes, touches the raw facet (see #getGadgetFacetRaw).
+  async getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number)
+      : Promise<Fetcher<DurableObject>> {
+    let params: OverseerRestoreParams = {type: "gadget", gadgetId};
+    chatId = this.#resolveGadgetChatId(gadgetId, chatId);
+    if (chatId !== undefined) params.chatId = chatId;
+    return await this.ctx.restore(params);  // validates the gadget exists, in [restore]()
+  }
 
-    if (chatId !== undefined) {
-      // Check if the requested chat proposes changes to *this gadget* (code, provisional
-      // creation, or a provisional binding edge -- see proposedChangeWorkpieceIds). If not, load
-      // the main-branch facet: the chat context would run identical code (chatDocOwnsGadget) but
-      // as a needlessly separate instance, restarted on every proposedChangesChanged().
-      let meta = this.storage.chatMeta.get(chatId);
-      if (!meta || !this.proposedChangeWorkpieceIds(chatId, meta).includes(gadgetId)) {
-        chatId = undefined;
-      }
+  // Narrow `chatId` to the case where it actually changes what code runs: the chat proposes
+  // changes to *this gadget* (code, provisional creation, or a provisional binding edge -- see
+  // proposedChangeWorkpieceIds). Otherwise return undefined to load the main-branch facet: the
+  // chat context would run identical code (chatDocOwnsGadget) but as a needlessly separate
+  // instance, restarted on every proposedChangesChanged(). A chat that no longer exists (e.g. a
+  // chatId sealed into a persistent stub, see OverseerRestoreParams.chatId) likewise resolves to
+  // main.
+  #resolveGadgetChatId(gadgetId: WorkpieceId, chatId: number | undefined): number | undefined {
+    if (chatId === undefined) return undefined;
+    let meta = this.storage.chatMeta.get(chatId);
+    if (!meta || !this.proposedChangeWorkpieceIds(chatId, meta).includes(gadgetId)) {
+      return undefined;
     }
+    return chatId;
+  }
 
+  // The bare facet stub behind getGadgetFacetFetcher(). Only [restore]() may call this (see the
+  // comment there): a request made on the returned stub leaves the facet unable to call its own
+  // ctx.restore(). `chatId` must already be resolved by #resolveGadgetChatId.
+  #getGadgetFacetRaw(gadgetId: WorkpieceId, chatId: number | undefined): Fetcher<DurableObject> {
     // If we switched chats since the last time we ran the gadget and either the old or new chat
     // has proposed changes, this means we're changing what code is running, so we need to reset
     // the gadget. this.#runningChatIds tracks, for each gadget, which chat's proposed changes are
@@ -5086,7 +5108,7 @@ class OverseerImpl implements AgentHooks {
   // look like an RpcTarget instead.
   async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionKind)
       : Promise<RpcStub<any>> {
-    let facet = this.getGadgetFacetFetcher(gadgetId, chatId);
+    let facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
     let leaveSession = joinAs ? this.joinSession(joinAs) : undefined;
 
     let self = this;
@@ -9637,7 +9659,9 @@ class OverseerImpl implements AgentHooks {
     // Old params (persisted before multi-gadget support, sealed inside hook callbacks) have no
     // gadgetId; they resolve to the default gadget. If that gadget was deleted (or there is no
     // default), this fails with an explicit error rather than silently retargeting.
-    return this.getGadgetFacetFetcher(this.resolveGadgetId(params.gadgetId));
+    let gadgetId = this.resolveGadgetId(params.gadgetId);
+    this.getGadgetRecord(gadgetId);  // validate it exists
+    return this.#getGadgetFacetRaw(gadgetId, this.#resolveGadgetChatId(gadgetId, params.chatId));
   }
 }
 
@@ -9650,6 +9674,15 @@ type OverseerRestoreParams = {
   // stubs where a migration cannot rewrite them. If absent and the workspace has no default
   // gadget (or the default gadget was deleted), restoration fails with an explicit error.
   gadgetId?: WorkpieceId;
+
+  // Present when the stub was minted to run the gadget with this chat's proposed changes
+  // (getGadgetFacetFetcher only sets it once #resolveGadgetChatId has confirmed the chat really
+  // does propose changes to the gadget). Because the gadget's own ctx.restore() chains off the
+  // stub it was called through, a persistent stub minted by the proposed version carries this
+  // too, and so keeps restoring to that version for as long as the chat still proposes changes
+  // to the gadget -- the code that created the stub is the code that knows what to do with it.
+  // Once the chat is committed, discarded or deleted, the same params resolve to main.
+  chatId?: number;
 
   // A hack: If present, and if the code injection table currently contains this ID, then
   // instead of returning the gadget stub, [restore]() loads a dynamic worker.

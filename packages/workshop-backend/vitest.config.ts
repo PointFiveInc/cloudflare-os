@@ -45,6 +45,8 @@ export default defineConfig({
         // `allow_irrevocable_stub_storage` as in wrangler.jsonc: the user DO persists account stubs.
         compatibilityFlags: ['experimental', 'nodejs_compat', 'allow_irrevocable_stub_storage'],
         bindings: { PUBLIC_BASE_URL: 'https://workshop.example/' },
+        // The overseer loads gadget code through this, so a test can run a real gadget facet.
+        workerLoaders: { LOADER: {} },
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },
