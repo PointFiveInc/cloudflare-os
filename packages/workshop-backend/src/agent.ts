@@ -581,7 +581,7 @@ Tools refer to Gadgets by their binding name in your env: the file tools (\`read
 
 Gadgets execute on a restricted and heavily-sandboxed variant of Cloudflare Workers.
 
-Each Gadget has two main files: client.js and server.js
+Each Gadget has two main files: client.js and server.js (plus any other files they import)
 
 server.js defines the Gadget's server-side logic, in the form of a Cloudflare Durable Object class. The class must be exported under the name \`Gadget\`. Unlike with normal Durable Objects on Cloudflare, there is no need to export a separate fetch handler; the Gadgets platform automatically takes care of routing requests to the Gadget. The Gadget has access to private storage via the regular Durable Objects KV and SQLite storage APIs. A simple server.js might look like:
 
@@ -603,6 +603,16 @@ document.body.appendChild(document.createTextNode(greeting));
 \`\`\`
 
 Note that there is no index.html. Instead, client.js must build the entire UI using JavaScript code.
+
+Both client.js and server.js may be split across additional files, imported with ordinary relative ES module imports: \`import {renderChart} from "./chart.js"\`, including from subdirectories (\`./lib/format.js\`). Prefer splitting a Gadget up once a file gets long. Two limits: client.js may import the vetted libraries listed below and nothing else -- no npm packages are available to server.js, and no other bare specifier is available to either side -- and client.js must not import server.js, since they run in different runtimes. Share code between them by putting it in a third file that both import.
+
+The vetted libraries client.js may import, and the only ones, are:
+
+* \`@gadget/pdf\` -- Mozilla's pdf.js (the pdfjs-dist API: \`getDocument\`, \`GlobalWorkerOptions\`, \`AnnotationMode\`, and the rest). Use it to render PDFs in the UI, e.g. \`let pdf = await getDocument({data: bytes}).promise\`, then \`pdf.getPage(n)\` and \`page.render({canvasContext, viewport})\`. Three things to know: there is no network in the sandbox, so the PDF bytes must come from the Gadget's own server over RPC (as a Uint8Array or ArrayBuffer) rather than from a URL; it runs on the main thread, so rendering a very large document will block the UI, and you should render page by page rather than all at once; and do not set \`cMapUrl\`, \`standardFontDataUrl\`, \`wasmUrl\` or \`GlobalWorkerOptions.workerSrc\`, since each names a resource that would have to be fetched and the sandbox has no network -- documents relying on non-embedded CJK fonts, ICC colour profiles, or JPEG 2000 images may therefore render imperfectly.
+
+  \`@gadget/pdf\`'s \`getDocument\` runs with pdf.js warnings turned off, because two of them are unavoidable in this sandbox and would otherwise appear on every single load: \`Setting up fake worker\` (pdf.js confirming it runs on the main thread, which is how it is meant to work here) and \`Failed to compile PostScript function to wasm, falling back to JS\` (the sandbox forbids compiling WebAssembly at runtime, so pdf.js uses its JavaScript implementation -- identical output, slower only for the few PDFs using PostScript calculator functions). Neither is a bug and neither is worth acting on. Pass \`verbosity: 1\` to \`getDocument\` if you are debugging and want pdf.js's warnings back.
+
+Importing a library a Gadget does not use costs it nothing, but do not import \`@gadget/pdf\` unless the Gadget actually renders PDFs: it is a large library, and it makes the Gadget's UI slower to load.
 
 Make Gadget UIs responsive and usable on both desktop and phones by default.
 

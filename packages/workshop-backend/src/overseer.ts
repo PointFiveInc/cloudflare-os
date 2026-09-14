@@ -34,6 +34,7 @@ import { chatChangeStatuses, foldProposedChanges, isCompactionTurn,
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
 import { WebFetchEnv } from "./web-fetch";
+import { BUNDLER_VERSION, GadgetBundleError, bundleGadgetClient } from "./gadget-bundle";
 import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
 import { AgentSpawnerBinding } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
@@ -154,6 +155,11 @@ class PlaceholderRpcTarget extends RpcTarget {
   }
 }
 `;
+
+// How many bundled Gadget UIs one Overseer keeps in memory. A bundle carrying a vetted library
+// is a couple of megabytes, so this is a memory bound first and a hit-rate choice second: enough
+// for the Gadgets a session actually cycles between, not enough to matter against the DO's limit.
+const UI_BUNDLE_CACHE_LIMIT = 8;
 
 let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
   compatibilityDate: "2026-02-01",
@@ -4157,11 +4163,84 @@ class OverseerImpl implements AgentHooks {
     return commitId !== undefined ? await this.gitStore.readCommitFiles(commitId) : new Map();
   }
 
+  // Bundled client code, keyed by the same thing loadGadgetWorker keys its loads by (see
+  // #uiBundleCacheKey). Bounded because a bundle that pulls in a vetted library is megabytes and
+  // the key moves on every merge: without a cap this grows for the lifetime of the DO.
+  #uiBundleCache = new Map<string, string>();
+
+  /**
+   * Identifies the exact code a bundle was built from: the mainline code version, plus the chat's
+   * sequence when reading a chat's proposed changes, plus the bundler's own version so a deploy
+   * cannot serve output built by an older bundler. Same construction as loadGadgetWorker's loader
+   * key -- every merge bumps codeVersion, and every recorded change bumps the chat sequence, so
+   * neither mainline nor draft code can go stale under a live key.
+   */
+  #uiBundleCacheKey(gadgetId: WorkpieceId, chatId?: number): string {
+    let codeVersion = `${this.storage.codeVersion.get()}`;
+    if (chatId !== undefined) {
+      this.getChatMetaOrThrow(chatId);
+      let sequence = this.storage.nextChatSequences.get(chatId)?.nextSequence || 0;
+      codeVersion += `.${chatId}.${sequence}`;
+    }
+    return `${BUNDLER_VERSION}.${codeVersion}.${gadgetId}`;
+  }
+
   async getGadgetUiBundle(gadgetId: WorkpieceId, chatId?: number): Promise<UiBundle | null> {
-    // TODO: Bundle the UI? For now we just return client.js.
     this.checkChatExistsAndMaterializeChanges(chatId);
-    let jsCode = (await this.readGadgetFiles(gadgetId, chatId)).get("client.js");
-    return jsCode !== undefined ? {jsCode} : null;
+    let files = await this.readGadgetFiles(gadgetId, chatId);
+    // No client.js at all is a Gadget with no UI, not a build failure.
+    if (!files.has("client.js")) return null;
+
+    // Bundling a Gadget that imports a vetted library costs seconds, and this is called on every
+    // UI load and again on every export -- so the same unchanged code must not be rebuilt.
+    let cacheKey = this.#uiBundleCacheKey(gadgetId, chatId);
+    let cached = this.#uiBundleCache.get(cacheKey);
+    if (cached !== undefined) {
+      // Logged, not silent: "the Gadget is slow to load" needs to be attributable to bundling
+      // here or to the browser parsing a multi-megabyte data: URL there, and only the server side
+      // can say which.
+      this.logger.info("served a cached Gadget UI bundle", {
+        event: "gadget.ui.bundle.cached", chatId, size: cached.length,
+      });
+      return {jsCode: cached};
+    }
+
+    try {
+      // A Gadget that imports nothing gets its client.js back verbatim; see bundleGadgetClient.
+      let startedAt = Date.now();
+      let jsCode = await bundleGadgetClient(this.env.LOADER, `${this.ctx.id}`, files);
+      // Distinct event names rather than a "bundled" field: the field vocabulary in
+      // observability.ts is deliberately closed, and the distinction is worth a name anyway --
+      // a passthrough means the bundler was never involved.
+      this.logger.info("built a Gadget UI bundle", {
+        event: jsCode === files.get("client.js")
+            ? "gadget.ui.bundle.passthrough"
+            : "gadget.ui.bundle.built",
+        chatId, size: jsCode.length, durationMs: Date.now() - startedAt,
+      });
+      // Insertion-ordered, so the oldest key is the first one -- a plain FIFO is enough here:
+      // entries are invalidated by the key moving, not by age, and the cap only exists to bound
+      // memory.
+      if (this.#uiBundleCache.size >= UI_BUNDLE_CACHE_LIMIT) {
+        this.#uiBundleCache.delete(this.#uiBundleCache.keys().next().value!);
+      }
+      this.#uiBundleCache.set(cacheKey, jsCode);
+      return {jsCode};
+    } catch (error) {
+      // A build failure happens before the browser runs anything, so none of GadgetUI.tsx's
+      // window.onerror/unhandledrejection forwarding sees it, and the frontend can only show a
+      // generic "Failed to load UI bundle" banner. Push the real per-file reasons down the same
+      // pipe runtime console errors already take, so the agent can act on them; then rethrow, so
+      // the banner still appears.
+      if (error instanceof GadgetBundleError) {
+        this.deliverGadgetLogs(chatId ?? null, error.errors.map(text => ({
+          timestamp: new Date(),
+          level: "error" as const,
+          message: [text],
+        })));
+      }
+      throw error;
+    }
   }
 
   async getGadgetExportFormats(gadgetId: WorkpieceId, chatId?: number)

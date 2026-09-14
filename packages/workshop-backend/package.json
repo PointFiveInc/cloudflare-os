@@ -35,6 +35,8 @@
     "@gadgets/scripts": "workspace:*",
     "dompurify": "^3.4.13",
     "esbuild": "^0.28.1",
+    "esbuild-wasm": "^0.28.2",
+    "pdfjs-dist": "^6.3.289",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "wrangler": "catalog:"
