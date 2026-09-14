@@ -1,0 +1,112 @@
+# Keeps this fork current with cloudflare/cloudflare-os.
+#
+# `main` here is a pure mirror of upstream and is fast-forwarded untouched. `p5` carries
+# PointFive's own commits on top, and upstream is MERGED into it -- never rebased. Rebasing would
+# rewrite the SHAs that PointFiveInc/pointfive-os pins in its submodule gitlink, orphaning every
+# commit any past deployment was built from.
+#
+# A clean merge is pushed straight to `p5`. A conflicting one opens a PR instead, so a human
+# resolves it rather than a robot guessing.
+name: Sync upstream
+
+on:
+  schedule:
+    # Mondays 06:00 UTC. pointfive-os's Dependabot runs at 09:00 the same day, so its submodule
+    # bump PR reflects this run rather than last week's tip.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: p5
+          # Full history: a merge needs the common ancestor with upstream.
+          fetch-depth: 0
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/cloudflare/cloudflare-os.git
+          git fetch upstream main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward the main mirror
+        # Keeps `main` byte-identical to upstream so GitHub's compare views stay meaningful and the
+        # "Sync fork" button on the repo's default branch remains the safe, boring operation.
+        run: |
+          git push origin refs/remotes/upstream/main:refs/heads/main
+
+      - name: Stop if upstream has nothing new
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "p5 already contains upstream/main; nothing to do."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream into p5
+        id: merge
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Flag workflow changes
+        # A workflow file arriving from upstream is live the moment it lands. Every inherited
+        # cloudflare-os workflow is disabled in this fork's Actions tab on purpose; a new one would
+        # not be. Fail loudly so someone looks rather than letting it run unreviewed.
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          if ! git diff --quiet HEAD@{1} HEAD -- .github/workflows/; then
+            echo "::error::This merge changed .github/workflows/. Review it and disable any new"
+            echo "::error::workflow in the Actions tab before pushing. Not pushed."
+            git diff --stat HEAD@{1} HEAD -- .github/workflows/
+            exit 1
+          fi
+
+      - name: Push the merge
+        if: steps.merge.outputs.conflict == 'false'
+        run: git push origin p5
+
+      - name: Open a PR for a conflicting merge
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="upstream-sync/$(date -u +%Y-%m-%d)"
+          git push -f origin "refs/remotes/upstream/main:refs/heads/$BRANCH"
+          if [ "$(gh pr list --head "$BRANCH" --base p5 --state open --json number --jq 'length')" != "0" ]; then
+            echo "A PR for $BRANCH is already open."
+            exit 0
+          fi
+          {
+            echo "Automated upstream sync could not merge cleanly into \`p5\`; resolve by hand."
+            echo
+            echo "Merge, never rebase: \`PointFiveInc/pointfive-os\` pins \`p5\` commits by SHA in"
+            echo "its submodule gitlink, and rebasing would orphan them."
+            echo
+            echo "After merging, check that \`pnpm check\` still passes in \`pointfive-os\` against"
+            echo "the new \`p5\` tip before bumping its gitlink -- \`requireForkChanges()\` there"
+            echo "asserts PointFive's changes survived the merge."
+          } > /tmp/pr-body.md
+          gh pr create --base p5 --head "$BRANCH" \
+            --title "Merge upstream cloudflare-os into p5 ($BRANCH)" \
+            --body-file /tmp/pr-body.md
