@@ -500,7 +500,11 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           height: '100%',
           border: 'none'
         }}
-        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+        // allow-downloads lets the Gadget UI hand the user a file it built itself (blob URL +
+        // <a download>). Without it the browser silently blocks the save. The bytes reach the
+        // iframe over the capnweb MessagePort, not fetch(), so the CSP's connect-src 'none'
+        // above is not in this path and stays as-is.
+        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads"
         title="Gadget UI"
       />
     </div>
