@@ -1,3 +1,5 @@
+/** Pending-action indexing, pure replay, and provisional-ID mapping. */
+
 import type { KvReadWrite } from "./kv";
 
 /** One action journal entry visible to simulation. */
@@ -24,6 +26,15 @@ export type SimulationView<R extends SimulationRecord<unknown>, Target> = {
  * @param records Journal snapshot.
  * @param targets Extracts targets from an action.
  * @returns A frozen, indexed simulation view.
+ *
+ * @example
+ * ```ts
+ * const pending = createSimulationView(
+ *   journal.listPending(),
+ *   action => [action.projectId],
+ * ).forTarget(project.id);
+ * return replaySimulation(project, pending, applyPendingAction);
+ * ```
  */
 export function createSimulationView<R extends SimulationRecord<unknown>, Target>(
   records: readonly R[],
@@ -105,7 +116,11 @@ export function replaySimulation<State, R>(
 /** The synchronous Durable Object KV surface used by provisional IDs. */
 export type SimulationKv = KvReadWrite;
 
-/** Allocates durable provisional IDs and retains their provider-ID bindings. */
+/**
+ * Allocates durable provisional IDs and retains their provider-ID bindings.
+ *
+ * Namespaces sharing one KV object must be disjoint; this convention is not checked at runtime.
+ */
 export class ProvisionalIds<Id extends string> {
   readonly #kv: SimulationKv;
   readonly #namespace: string;
@@ -188,12 +203,19 @@ export class ProvisionalIds<Id extends string> {
   }
 
   /**
-   * Checks whether an ID has a durable binding.
-   * @param id ID to check.
-   * @returns Whether a binding exists.
+   * Checks whether an ID can be sent to the provider — a classified provider ID, or a provisional
+   * one bound to a target the classifier accepts. Without a classifier only a binding counts,
+   * since nothing can tell an unbound provisional from a provider ID.
+   * @param id Provisional or provider ID.
+   * @returns Whether the ID is safe to pass through — that is, not an unbound provisional
+   * reference. Classification is syntactic: nothing here confirms the provider holds the object.
    */
   isResolved(id: Id): boolean {
-    return this.#bound(id) !== undefined;
+    if (this.#isProvisional?.(id) === false) return true;
+    const bound = this.#bound(id);
+    // Classified on the way out too, exactly as `requireResolved` does: a pair an instance with no
+    // classifier wrote may aim at something the provider still does not have.
+    return bound !== undefined && this.#isProvisional?.(bound) !== true;
   }
 
   /**

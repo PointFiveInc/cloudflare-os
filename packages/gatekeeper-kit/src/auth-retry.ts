@@ -1,3 +1,5 @@
+/** One-retry authentication recovery for replayable provider calls. */
+
 /** How `withAuthRetry` obtains tokens and classifies failures. */
 export type AuthRetryOptions<Token> = {
   /**
@@ -12,13 +14,29 @@ export type AuthRetryOptions<Token> = {
    * @returns Whether credentials caused the failure.
    */
   isAuthError(error: unknown): boolean;
+  /** Acknowledges the operation may execute twice; only replay-safe calls qualify. */
+  replayable: true;
 };
 
 /**
- * Retries once after provider-confirmed credential rejection.
+ * Retries once after provider-confirmed credential rejection. This helper never reports expiry:
+ * the refresh happens where no account adjudicates it, so recovery and grant death alike stay
+ * invisible to the Workshop. Provider calls made through a `CredentialSource` get the one-retry
+ * doctrine from `run(operation, { replayable: true })`, where the account heals past a stale
+ * credential inside the rejection adjudication and confirmed grant death is reported; this helper
+ * remains for token flows that hold no source.
  * @param options Token acquisition and error policy.
- * @param run Replayable provider operation.
+ * @param run Replayable provider operation, executed at most twice.
  * @returns The first successful result.
+ *
+ * @example
+ * ```ts
+ * return withAuthRetry({
+ *   getToken: options => this.#account.getToken(options),
+ *   isAuthError: error => error instanceof VendorApiError && error.status === 401,
+ *   replayable: true,
+ * }, token => this.#api.listProjects(token));
+ * ```
  */
 export async function withAuthRetry<Token, T>(
   options: AuthRetryOptions<Token>,

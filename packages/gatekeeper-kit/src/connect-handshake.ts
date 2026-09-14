@@ -1,3 +1,5 @@
+/** The initiation-to-OAuth nonce handoff for gatekeeper connect flows. */
+
 import {
   generateNonce,
   INITIATION_NONCE_LIFETIME_MS,
@@ -5,13 +7,10 @@ import {
   OAUTH_NONCE_LIFETIME_MS,
   type TimedNonce,
 } from "./connect-nonce";
+import type { KvMutable } from "./kv";
 
 /** The Durable Object KV surface this module needs. */
-export type ConnectNonceKv = {
-  get<T>(key: string): T | undefined;
-  put<T>(key: string, value: T): void;
-  delete(key: string): void;
-};
+export type ConnectNonceKv = KvMutable;
 
 /** KV key holding the in-flight connect nonce. Unchanged from every current gatekeeper. */
 export const NONCE_KEY = "nonce";
@@ -58,6 +57,20 @@ export function putInitiation(kv: ConnectNonceKv, initiationNonce: string, now: 
  * @param now Current Unix time in milliseconds.
  * @param extra Provider metadata to retain through the callback.
  * @returns The OAuth nonce, or `null` when invalid.
+ *
+ * @example
+ * ```ts
+ * putInitiation(ctx.storage.kv, linkNonce, Date.now());
+ *
+ * // On form submission, rotate the link nonce and retain callback state in one write.
+ * const state = advanceToOAuth(
+ *   ctx.storage.kv, linkNonce, Date.now(), { codeVerifier, returnTo },
+ * );
+ * if (state === null) {
+ *   return htmlResponse(errorPageHtml("Connection expired", "Start again."), 400);
+ * }
+ * return Response.redirect(authorizationUrl({ state }));
+ * ```
  */
 export function advanceToOAuth<Extra extends object>(
   kv: ConnectNonceKv,
@@ -82,7 +95,10 @@ export function advanceToOAuth<Extra extends object>(
 }
 
 /**
- * Claims a valid OAuth callback.
+ * Claims a valid OAuth callback. The claim is irrevocable: the nonce is consumed whatever happens
+ * next, so a consumer whose `complete()` or credential persistence fails after the provider
+ * exchange must roll back anything it just persisted itself — the storage shape is provider-owned,
+ * and a second callback with the same nonce will not arrive.
  * @param kv Durable Object nonce storage.
  * @param oauthNonce Provider-returned nonce.
  * @param now Current Unix time in milliseconds.
