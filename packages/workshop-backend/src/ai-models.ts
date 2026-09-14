@@ -461,6 +461,10 @@ function getModelViaGateway(
         `Bearer ${binding ? CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL : gwConfig.apiToken}`,
     Authorization: null,
     "x-api-key": null,
+    // Selects a non-"default" stored provider key alias, when the deployment named one. Harmless
+    // to send unconditionally: a provider with no matching alias configured just falls back to its
+    // own "default" lookup.
+    ...(gwConfig.byokAlias ? { "cf-aig-byok-alias": gwConfig.byokAlias } : {}),
   };
   const gatewayBase =
       `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;

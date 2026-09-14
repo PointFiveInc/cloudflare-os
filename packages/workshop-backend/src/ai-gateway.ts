@@ -47,6 +47,13 @@ export class AiGatewayConfig {
    */
   readonly binding?: Ai;
   readonly providers: Set<string>;
+  /**
+   * Non-"default" stored provider key alias to select on the gateway (cf-aig-byok-alias). Applies
+   * only to direct provider-passthrough requests -- which is what every gateway-routed provider
+   * here makes (see gatewayNativeModel's baseUrls in ai-models.ts) -- not to Unified Billing
+   * endpoints, which always consult the "default" alias regardless of this header.
+   */
+  readonly byokAlias?: string;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -72,6 +79,7 @@ export class AiGatewayConfig {
           "with --use-workers-ai-binding) or set CF_AI_GATEWAY_API_TOKEN (a Run + Read token).");
     }
     this.sameAccountGateway = this.binding ? this.gateway : undefined;
+    this.byokAlias = env.CF_AI_GATEWAY_BYOK_ALIAS || undefined;
     this.providers = new Set(
       (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map(s => s.trim()).filter(s => s !== "")
     );
