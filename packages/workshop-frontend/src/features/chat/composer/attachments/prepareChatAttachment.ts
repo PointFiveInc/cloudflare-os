@@ -30,6 +30,11 @@ export const prepareChatAttachment = async (
       `Images must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_IMAGE_BYTES)} or smaller before resizing.`,
     );
   }
+  // createImageBitmap() cannot decode a vector source, so name the problem here rather than let
+  // the decode below fail with the browser's opaque "the source image could not be decoded".
+  if (file.type === "image/svg+xml") {
+    throw new Error("SVG images aren't supported. Convert it to PNG or JPEG first.");
+  }
 
   const bitmap = await createImageBitmap(file);
   try {
@@ -54,13 +59,19 @@ export const prepareChatAttachment = async (
     // original filename extension.
     const outputMimeType = supportedOriginalType ? file.type : "image/jpeg";
     const quality = outputMimeType === "image/png" ? undefined : 0.85;
-    const blob = await canvasToBlob(canvas, outputMimeType, quality);
-    if (blob.size > MAX_CHAT_ATTACHMENT_BYTES) {
-      throw new Error(
-        `Attachments must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} or smaller.`,
-      );
+    // PNG is lossless, so a photograph stays above the cap however far it is scaled. Fall back
+    // through the other accepted encodings rather than reject it; WebP precedes JPEG to keep a
+    // PNG's alpha, and a browser lacking an encoder returns PNG, so the type is re-checked.
+    for (const next of [{type: outputMimeType, q: quality}, {type: "image/webp", q: 0.85},
+                        {type: "image/jpeg", q: 0.85}, {type: "image/webp", q: 0.6}]) {
+      const blob = await canvasToBlob(canvas, next.type, next.q);
+      if (blob.type === next.type && blob.size <= MAX_CHAT_ATTACHMENT_BYTES) {
+        return { blob, mimeType: next.type };
+      }
     }
-    return { blob, mimeType: outputMimeType };
+    throw new Error(
+      `Attachments must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} or smaller.`,
+    );
   } finally {
     bitmap.close();
   }
