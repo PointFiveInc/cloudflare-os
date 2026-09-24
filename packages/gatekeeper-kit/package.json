@@ -19,6 +19,7 @@
     "./endpoint": "./src/endpoint.ts",
     "./http-errors": "./src/http-errors.ts",
     "./observers": "./src/observers.ts",
+    "./oauth-client": "./src/oauth-client.ts",
     "./preview-oauth": "./src/preview-oauth.ts",
     "./response-body": "./src/response-body.ts",
     "./simulation": "./src/simulation.ts"
@@ -31,7 +32,7 @@
   "dependencies": {
     "@gadgets/backend-utils": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
-    "jose": "^6.2.8"
+    "jose": "^6.2.12"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "catalog:",
