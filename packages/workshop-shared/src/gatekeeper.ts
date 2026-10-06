@@ -771,6 +771,13 @@ export interface GatekeeperUserVerifier extends WorkerEntrypoint {}
  *
  * The Gatekeeper executes as a Durable Object Facet, where it is a child of the Overseer. This
  * interface is exposed to the Overseer, not directly to the Gadget.
+ *
+ * A Gatekeeper may mint persistent stubs to itself with `this.ctx.restore(params)` and a
+ * `[restore](params)` method (see `ApprovalQueue.bindHook()`), e.g. for its worker's push handler
+ * to deliver events through. They keep restoring until the connection is removed from the
+ * workspace, and reach whatever `[restore]()` returns: return a target narrowed to the stub's
+ * purpose, never the Gatekeeper itself (which answers Overseer-only calls such as `applyAction()`),
+ * and keep the stubs within the gatekeeper's own worker.
  */
 export interface Gatekeeper<Session> extends DurableObject {
   /**
@@ -1186,6 +1193,9 @@ export type ObservationDescription = {
    */
   description: string;
 
+  /** Values shown literally after `description`, as in `ActionDescription.fields`. */
+  fields?: ActionField[];
+
   // ----------------------------------------------------------------------------
   // Policy hints
   //
@@ -1204,12 +1214,17 @@ export type ObservationDescription = {
    * - Every collaborator must pass this gatekeeper's `addObserver()` to open the gadget, so a
    *   gatekeeper whose `addObserver()` always throws makes the gadget effectively unshareable
    *   once it has made one of these observations.
-   * - Once observed, the gadget enters a restricted mode: no more actions or public-web fetches,
-   *   only observations, so the gadget cannot leak the data through other gatekeepers.
+   * - Once observed, the gadget enters a restricted mode: no public-web fetches, and every action
+   *   requires manual approval -- auto-approval rules are suspended. The approver is shown the
+   *   action's full `description` and is responsible for checking it contains none of the
+   *   restricted data. An action whose description is not complete
+   *   (`ActionDescription.descriptionIsComplete`) is accepted and flagged to the approver; only
+   *   git pushes are refused. The kernel does not restrict which connections may be acted on.
    *
    * TODO(someday): The restricted mode is a blunt instrument. It should be possible to perform
-   *   actions whose visibility is limited to people verified to have access to the same data,
-   *   but this requires a more complex policy framework to compute.
+   *   actions whose visibility is limited to people verified to have access to the same data: an
+   *   action should declare who can see its effects, and each restricted producer verify that
+   *   every such person can already see the data.
    */
   containsRestrictedData?: boolean;
 
@@ -1247,6 +1262,46 @@ export type ObservationDescription = {
   excludeObservers?: string[];
 }
 
+/** The language a `text` action field is written in, named so the approver knows how it is read. */
+export type ActionFieldSyntax = "markdown" | "html" | "sql";
+
+/**
+ * One value an approver reviews, carried as data so surfaces show it literally. `label` is the
+ * gatekeeper's own name for the value; everything else is the value as the action will send it.
+ */
+export type ActionField = {
+  /** The gatekeeper's name for the value, such as "Body" or "To". Plain text. */
+  label: string;
+
+  /**
+   * Present when `value` or `items` is not the whole value: the UTF-8 bytes shown and the bytes
+   * the whole value has. `shownBytes` of 0 means the field was omitted for lack of room.
+   */
+  truncated?: { shownBytes: number; totalBytes: number };
+} & (
+  /** A short single-line value, such as an ID or an address. */
+  | { kind: "inline"; value: string }
+  /** Text to read in full, line breaks included, optionally in a named language. */
+  | { kind: "text"; value: string; syntax?: ActionFieldSyntax }
+  /** Pretty-printed JSON, with every invisible character escaped so the text shows exactly. */
+  | { kind: "json"; value: string }
+  /** Short single-line values, one per row. */
+  | { kind: "list"; items: string[] }
+  /**
+   * Bytes named rather than shown. `origin` says where they come from: `"provider"` bytes are
+   * re-sent unchanged from the same provider, `"agent"` bytes come from this workspace and so
+   * leave the description incomplete.
+   */
+  | {
+    kind: "file";
+    name: string;
+    mediaType: string;
+    size: number;
+    sha256?: string;
+    origin: "provider" | "agent";
+  }
+);
+
 /**
  * A stable, machine-readable tag for an action paired with its human-readable display name; the two
  * always travel together. Policy decisions key on `tag` (auto-approval rules group on it today, and
@@ -1273,9 +1328,30 @@ export type ActionDescription = {
   /**
    * A complete description of the action to be taken, in Markdown-formatted natural language.
    * This will be displayed to the approver. It must include all details that might be relevant to
-   * consider before approving.
+   * consider before approving; see `descriptionIsComplete` for the standard this is held to.
+   * Values the approver reviews are better carried in `fields`, leaving this the gatekeeper's own
+   * prose.
    */
   description: string;
+
+  /**
+   * The values the approver reviews, as typed data shown literally after `description`: never
+   * rendered as Markdown, so a value needs no escaping to display as exactly itself.
+   */
+  fields?: ActionField[];
+
+  /**
+   * The gatekeeper's assertion that `description` and `fields` together reproduce, verbatim, every
+   * piece of content originating in this workspace that applying the action will write or send:
+   * bodies, field values, identifiers, serialized arguments. Bytes the gatekeeper re-sends
+   * unchanged from the same provider may instead be named by size and digest, as a `file` field
+   * with `origin: "provider"`. A provisional ID standing for something this workspace creates
+   * counts as shown when the description says the gatekeeper sends the provider's ID in its place.
+   * Absent means incomplete: a summary, a truncated field, or opaque bytes the approver cannot read
+   * as text. A push (`pushedCommits`) is never complete. Approval surfaces tell the approver when
+   * this is absent; an incomplete description is never refused for that reason.
+   */
+  descriptionIsComplete?: boolean;
 
   /**
    * If present, applying this action will push the named commits to the remote resource this
@@ -1566,9 +1642,14 @@ export interface GitCache extends RpcTarget {
   buildPack(): Promise<ReadableStream<Uint8Array>>;
 
   /**
-   * Consumes a standard git packfile and inserts all the objects within into the git cache. This
-   * is exactly equivalent to if the Gatekeeper decoded the packfile itself and `put()` each object
-   * into the cache.
+   * Consumes a standard git packfile, storing each object in it as `put()` would, and returns
+   * the oids of those now in the cache. An object too large to store is measured and left out of
+   * the result rather than thrown on, which is how a `gitPull()` notices it.
+   *
+   * The pack is decoded in one pass, so a delta must follow its base, as in every pack
+   * `git upload-pack` sends. Objects are stored as the pack streams in, and its commits last,
+   * once the rest has verified and been stored: a pack that fails can leave some of its objects
+   * stored, but not a commit without the trees that came with it.
    */
   consumePack(pack: ReadableStream<Uint8Array>): Promise<GitOid[]>;
 

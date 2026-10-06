@@ -3,7 +3,6 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   ApprovalQueue,
   stripTrailingSlashes,
-  type ActionDescription,
   type AccountDescription,
   type ConnectHandoff,
   type Cursor,
@@ -21,13 +20,24 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  ActionDescriptionBuilder, buildDescription, codeSpan, type RenderedDescription,
+} from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import {
+  clearCredentialExpiryLatch, notifyCredentialsExpiredOnce,
+} from "@gadgets/gatekeeper-kit/credential-expiry";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  CredentialCoordinator, isCredentialsExpired, type RejectionVerdict,
+} from "@gadgets/gatekeeper-kit/credentials";
 import {
   GitHubApi,
   GitHubApiError,
   exchangeAuthCode,
+  refreshGitHubGrant,
   revokeOAuthToken,
+  type GitHubOAuthGrant,
   type ConditionalRequestResult,
   type GitHubCompareResponse,
   type GitHubIssueCommentResponse,
@@ -112,6 +122,7 @@ import {
   GitHubIssueConfiguratorUI,
   GitHubPullRequestConfiguratorUI,
   GitHubRepoConfiguratorUI,
+  type GitHubApiRunner,
 } from "./github-configurators";
 import GITHUB_ISSUE_CONFIGURATOR_HTML from "./generated/github-issue-configurator-ui.txt";
 import GITHUB_PULL_REQUEST_CONFIGURATOR_HTML from "./generated/github-pull-request-configurator-ui.txt";
@@ -319,6 +330,149 @@ type GitHubAction =
   | ReplyToDiffCommentAction
   | MergePullRequestAction
   | PushAction;
+
+// Apply replaces `#~N` in a Markdown body with the GitHub number of the issue or pull request
+// created in this workspace as `~N`. Both name the same thing, so the body shown stays the body
+// sent, but the approver is told the number will change.
+const PROVISIONAL_REFERENCE = /#~\d+/;
+
+function noteReferenceRewrite(builder: ActionDescriptionBuilder, ...bodies: (string | undefined)[]):
+    ActionDescriptionBuilder {
+  return bodies.some(body => body !== undefined && PROVISIONAL_REFERENCE.test(body))
+    ? builder.prose(
+      "References like #~N to issues or pull requests created in this workspace are replaced " +
+      "with their GitHub numbers when applied.")
+    : builder;
+}
+
+// The label set a `removeLabels` apply writes with `setLabels`: the labels staged in
+// `previousLabels` minus the removed ones, compared case-insensitively.
+function remainingLabels(action: RemoveLabelsAction): string[] {
+  return action.previousLabels.filter(
+    label => !action.labels.some(removed => removed.toLowerCase() === label.toLowerCase()));
+}
+
+/**
+ * The approver-facing text for a staged action, rendered from the payload that will be applied so
+ * every body, title, label and commit message the agent wrote is there to read in full. A push is
+ * the one action whose content (git objects) cannot be shown as text, so its description is a
+ * summary and never claims to be complete. Prose interpolates only the gatekeeper's logical ids
+ * and the bound repository; agent arguments, enums included, sit in fields or code spans.
+ */
+function describeGitHubAction(action: GitHubAction): RenderedDescription {
+  const repo = `${action.owner}/${action.repo}`;
+  switch (action.type) {
+    case "createIssue": {
+      const { options } = action;
+      return noteReferenceRewrite(buildDescription(`Create a new issue in ${repo}.`)
+        .inline("Provisional ID", action.provisionalId)
+        .inline("Title", options.title)
+        .verbatim("Body", options.bodyMarkdown ?? "", "markdown")
+        .list("Labels", options.labels ?? [])
+        .list("Assignees", options.assignees ?? []), options.bodyMarkdown)
+        .finish();
+    }
+    case "createPullRequest": {
+      const { options } = action;
+      return noteReferenceRewrite(buildDescription(
+        `Create a new ${options.draft ? "draft " : ""}pull request in ${repo}.`)
+        .inline("Provisional ID", action.provisionalId)
+        .inline("Title", options.title)
+        .inline("Head branch", options.head)
+        .inline("Base branch", options.base)
+        .verbatim("Body", options.bodyMarkdown ?? "", "markdown"), options.bodyMarkdown)
+        .finish();
+    }
+    case "setTitle":
+      return buildDescription(`Change the title of #${action.targetId}.`)
+        .inline("Current title", action.previousTitle)
+        .inline("New title", action.title)
+        .finish();
+    case "setBody":
+      return noteReferenceRewrite(
+        buildDescription(`Replace the Markdown body of #${action.targetId}.`)
+          .verbatim("New body", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
+        .finish();
+    case "addLabels":
+      return buildDescription(`Add labels to #${action.targetId}.`)
+        .list("Labels", action.labels)
+        .finish();
+    case "removeLabels":
+      return buildDescription(
+        `Remove labels from #${action.targetId} by replacing its labels with the resulting set ` +
+        "below, computed from its labels when this was staged. Any label added after this was " +
+        "staged is removed too, and any other label removed since is added back.")
+        .list("Remove", action.labels)
+        .list("Resulting labels", remainingLabels(action))
+        .finish();
+    case "changeState": {
+      if (action.state !== "closed") {
+        return buildDescription(`Reopen #${action.targetId}.`).finish();
+      }
+      const builder = buildDescription(`Close #${action.targetId}.`);
+      if (action.reason) builder.inline("Reason", action.reason);
+      return builder.finish();
+    }
+    case "postComment":
+      return noteReferenceRewrite(
+        buildDescription(`Post a new Markdown comment on #${action.targetId}.`)
+          .verbatim("Comment", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
+        .finish();
+    case "postReview": {
+      const { review } = action;
+      const builder = buildDescription(`Submit a review for pull request #${action.pullId}.`)
+        .inline("Decision", review.decision)
+        .inline("Reviewed head", review.revision.headSha)
+        .verbatim("Body", review.bodyMarkdown ?? "", "markdown");
+      for (const [index, comment] of (review.diffComments ?? []).entries()) {
+        const { target } = comment;
+        // Every coordinate apply sends: a multi-line range carries its own start side.
+        const where = target.subjectType === "file"
+          ? `${target.path} (whole file)`
+          : `${target.path}:${target.startLine !== undefined
+            ? `${target.startLine}${target.startSide ? ` (${target.startSide})` : ""}-`
+            : ""}${target.line} (${target.side})`;
+        builder
+          .inline(`Diff comment ${index + 1} on`, where)
+          .inline(`Diff comment ${index + 1} provisional ID`, comment.provisionalCommentId)
+          .verbatim(`Diff comment ${index + 1}`, comment.bodyMarkdown, "markdown");
+      }
+      return noteReferenceRewrite(builder, review.bodyMarkdown,
+        ...(review.diffComments ?? []).map(comment => comment.bodyMarkdown)).finish();
+    }
+    case "replyToDiffComment":
+      return noteReferenceRewrite(
+        buildDescription(`Reply to a diff discussion thread on pull request #${action.pullId}.`)
+          .inline("Thread", action.commentId)
+          .inline("Provisional ID", action.provisionalCommentId)
+          .verbatim("Reply", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
+        .finish();
+    case "mergePullRequest": {
+      const options = action.options ?? {};
+      const builder = buildDescription(`Merge pull request #${action.pullId}.`);
+      if (options.method !== undefined) builder.inline("Method", options.method);
+      if (options.commitTitle !== undefined) builder.verbatim("Commit title", options.commitTitle);
+      if (options.commitMessage !== undefined) {
+        builder.verbatim("Commit message", options.commitMessage);
+      }
+      if (options.expectedHeadSha !== undefined) {
+        builder.inline("Expected head", options.expectedHeadSha);
+      }
+      return builder.finish();
+    }
+    case "push": {
+      const creating = action.expectedOldSha === ZERO_OID;
+      const description = creating
+        ? `Push commit ${codeSpan(action.newSha)} to ${repo}, ` +
+          `creating branch ${codeSpan(action.branch)}.`
+        : `Push commit ${codeSpan(action.newSha)} to branch ${codeSpan(action.branch)} of ${repo}, ` +
+          `moving the branch from its current head ${codeSpan(action.expectedOldSha)}.` +
+          (action.force ? " This is a force push: it rewrites the branch's history." : "");
+      // The commits themselves cannot be reviewed as text here, so no completeness claim.
+      return { description };
+    }
+  }
+}
 
 type StoredActionRecord = {
   action: GitHubAction;
@@ -1237,10 +1391,49 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   }
 }
 
+const CREDENTIALS_EXPIRED_MESSAGE =
+  "GitHub credentials have expired or been revoked. Please reconnect the account.";
+
+/**
+ * Stands in for the identity of a token the account no longer serves, so the coordinator's
+ * moved-past gate adjudicates it. Never equal to a real identity, which is a hex nonce.
+ */
+const REPLACED_TOKEN_IDENTITY = "replaced-token";
+
 export class UserAccount extends DurableObject<Env> {
+  readonly #creds = new CredentialCoordinator<GitHubOAuthGrant>(this.ctx.storage.kv, {
+    expiresAt: grant => grant.expiresAt,
+    // The layout before expiring grants were supported, which only ever held non-expiring ones.
+    legacyKeys: ["accessToken", "scopes"],
+    upgrade: kv => {
+      const accessToken = kv.get<string>("accessToken");
+      if (!accessToken) return undefined;
+      // That layout latched its expiry notice before delivering it, so a failed delivery left a
+      // dead account showing as connected. Re-arm the latch as the grant migrates: at worst the
+      // Workshop hears of one death twice.
+      clearCredentialExpiryLatch(this.ctx.storage.kv);
+      return { accessToken, scopes: kv.get<string[]>("scopes") ?? [] };
+    },
+    // GitHub revokes one token at a time (see revokeOAuthToken), so dropping a refresh that a
+    // reconnect or revoke overtook cannot touch the grant that won.
+    discardMint: grant => this.#revokeToken(grant.accessToken),
+    vendorId: VENDOR_ID,
+  });
+
+  /** How the coordinator refreshes a grant and announces its death to the Workshop. */
+  readonly #recovery = {
+    refresh: async (grant: GitHubOAuthGrant): Promise<GitHubOAuthGrant> => {
+      const { CLIENT_ID, CLIENT_SECRET } = this.env;
+      if (!CLIENT_ID || !CLIENT_SECRET) throw new Error("GitHub OAuth is not configured.");
+      return await refreshGitHubGrant(CLIENT_ID, CLIENT_SECRET, CREDENTIALS_EXPIRED_MESSAGE)(grant);
+    },
+    notify: () => notifyCredentialsExpiredOnce(this.ctx.storage.kv,
+      this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback"), VENDOR_ID),
+  };
+
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string,
                     requestedScopes?: string[], ephemeral?: boolean): Promise<void> {
-    if (!this.ctx.storage.kv.get<string>("accessToken")) {
+    if (!this.#creds.stored()) {
       await this.ctx.storage.setAlarm(Date.now() + 3600 * 1000);
     }
 
@@ -1257,7 +1450,6 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async prepareReconnect(initiationNonce: string): Promise<void> {
-    this.ctx.storage.kv.put("expiredNotified", false);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
@@ -1317,15 +1509,12 @@ export class UserAccount extends DurableObject<Env> {
       const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
       handoff = await callback.reconnectComplete(stageId);
     } else {
-      this.ctx.storage.kv.put("accessToken", grant.accessToken);
-      this.ctx.storage.kv.put("scopes", grant.scopes);
-      this.ctx.storage.kv.put("expiredNotified", false);
+      this.#creds.connect(grant);
       try {
         const props = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (error) {
-        this.ctx.storage.kv.delete("accessToken");
-        this.ctx.storage.kv.delete("scopes");
+        this.#creds.clear();
         throw error;
       }
       // Auth-only sign-in grants are transient: the caller read the email via complete(), so
@@ -1343,61 +1532,107 @@ export class UserAccount extends DurableObject<Env> {
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<Awaited<ReturnType<typeof exchangeAuthCode>>>(
-      this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitStagedCredentials<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.ctx.storage.kv.put("accessToken", grant.accessToken);
-    this.ctx.storage.kv.put("scopes", grant.scopes);
-    this.ctx.storage.kv.put("expiredNotified", false);
+    this.#creds.connect(grant);
   }
 
-  getAccessToken(): string {
-    const accessToken = this.ctx.storage.kv.get<string>("accessToken");
-    if (!accessToken) {
-      throw new Error("GitHub credentials have not been configured for this account.");
-    }
-    return accessToken;
+  /**
+   * @returns The current access token, refreshing an expiring grant shortly before it expires.
+   * @throws `CredentialsExpiredError` when the account is disconnected or its grant is dead, after
+   * notifying the Workshop of a death.
+   */
+  async getAccessToken(): Promise<string> {
+    const { creds } = await this.#creds.snapshot(this.#recovery.refresh, this.#recovery);
+    return creds.accessToken;
   }
 
   getScopes(): string[] {
-    return this.ctx.storage.kv.get<string[]>("scopes") ?? [];
+    return this.#creds.stored()?.scopes ?? [];
   }
 
-  async noteCredentialsExpired(): Promise<void> {
-    if (this.ctx.storage.kv.get<boolean>("expiredNotified")) {
-      return;
-    }
-
-    this.ctx.storage.kv.put("expiredNotified", true);
-    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-    if (callback) {
-      await callback.credentialsExpired();
-    }
+  /**
+   * Adjudicates GitHub's rejection of `accessToken`, notifying the Workshop when the grant is
+   * dead. Using a refresh token makes GitHub reject the access token it replaced, so a request
+   * that presented a token this account has since replaced -- by a refresh or a reconnect -- failed
+   * stale. A rejection of the current token refreshes past it where the grant can.
+   */
+  async reportTokenRejected(accessToken: string): Promise<RejectionVerdict> {
+    const identity = this.#creds.stored()?.accessToken === accessToken
+      ? this.#creds.identity()
+      : REPLACED_TOKEN_IDENTITY;
+    return await this.#creds.adjudicateRejection(identity, this.#recovery);
   }
 
   async alarm(): Promise<void> {
     // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
     // grant (used once to read the email for login).
-    if (!this.ctx.storage.kv.get<string>("accessToken") || this.ctx.storage.kv.get<boolean>("ephemeral")) {
+    if (!this.#creds.stored() || this.ctx.storage.kv.get<boolean>("ephemeral")) {
       await this.ctx.storage.deleteAll();
     }
   }
 
   async revoke(): Promise<void> {
-    const accessToken = this.ctx.storage.kv.get<string>("accessToken");
-    if (accessToken && this.env.CLIENT_ID && this.env.CLIENT_SECRET) {
-      try {
-        await revokeOAuthToken(accessToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
-      } catch (error) {
-        logger.error("failed to revoke GitHub OAuth token", {
-          event: "oauth.token.revoke.failed", error,
-        });
-      }
-    }
-
+    const grant = this.#creds.stored();
+    // Fence before the first await: a refresh landing later is then discarded and its tokens
+    // revoked (see discardMint), rather than stored after this capture and deleted unrevoked.
+    this.#creds.clear();
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
+    if (grant) await this.#revokeToken(grant.accessToken);
   }
+
+  async #revokeToken(accessToken: string): Promise<void> {
+    if (!this.env.CLIENT_ID || !this.env.CLIENT_SECRET) return;
+    try {
+      await revokeOAuthToken(accessToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
+    } catch (error) {
+      logger.error("failed to revoke GitHub OAuth token", {
+        event: "oauth.token.revoke.failed", error,
+      });
+    }
+  }
+}
+
+/**
+ * Runs `fn` against GitHub as `account`. GitHub's rejection of the token a request presented is
+ * the account's to adjudicate, so a token replaced while the request was in flight fails as
+ * retryable rather than marking the account expired. With `replayable`, which only calls safe to
+ * run twice may pass, such a failure instead reruns `fn` once with the replacement token.
+ */
+async function withAccountApi<T>(
+  account: DurableObjectStub<UserAccount>, fn: (api: GitHubApi) => Promise<T>,
+  options: { replayable?: true } = {},
+): Promise<T> {
+  for (let replays = options.replayable ? 1 : 0; ; replays--) {
+    let presented: string | undefined;
+    const api = new GitHubApi(async () => (presented = await account.getAccessToken()));
+    try {
+      return await fn(api);
+    } catch (error) {
+      if (isCredentialsExpired(error)) {
+        throw new Error(CREDENTIALS_EXPIRED_MESSAGE, { cause: error });
+      }
+      if (!(error instanceof GitHubApiError && error.isAuthError) || presented === undefined) {
+        throw error;
+      }
+      const verdict = await account.reportTokenRejected(presented);
+      if (verdict === "expired") throw new Error(CREDENTIALS_EXPIRED_MESSAGE, { cause: error });
+      if (verdict !== "superseded") throw error;
+      if (replays > 0) continue;
+      throw new Error("GitHub credentials were renewed during this request. Please retry it.",
+        { cause: error });
+    }
+  }
+}
+
+/** Runs replay-safe GitHub reads as the account behind `userObjectId`; see withAccountApi. */
+function accountReader(
+  exports: Cloudflare.Exports, userObjectId: string,
+): GitHubApiRunner {
+  // The stub is made per call: a configurator outlives the request that created it.
+  return fn => withAccountApi(
+    exports.UserAccount.get(exports.UserAccount.idFromString(userObjectId)), fn, { replayable: true });
 }
 
 type GatekeeperUserImplProps = {
@@ -1410,16 +1645,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
     const scopes = await account.getScopes();
-    const api = new GitHubApi(async () => await account.getAccessToken());
-    try {
-      return await fn(api, scopes);
-    } catch (error) {
-      if (error instanceof GitHubApiError && error.isAuthError) {
-        await account.noteCredentialsExpired();
-        throw new Error("GitHub credentials have expired or been revoked. Please reconnect the account.", { cause: error });
-      }
-      throw error;
-    }
+    return await withAccountApi(account, api => fn(api, scopes));
   }
 
   async describe(): Promise<AccountDescription> {
@@ -1484,30 +1710,26 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   async startResourceConfigurator(
     resourceUrlPattern: string,
   ): Promise<ResourceConfiguratorFrame> {
-    const getToken = async () => {
-      const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
-      const account = this.ctx.exports.UserAccount.get(id);
-      return await account.getAccessToken();
-    };
+    const read = accountReader(this.ctx.exports, this.ctx.props.userObjectId);
 
     if (resourceUrlPattern === REPO_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_REPO_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubRepoConfiguratorUI(read)),
       };
     }
 
     if (resourceUrlPattern === ISSUE_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_ISSUE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubIssueConfiguratorUI(read)),
       };
     }
 
     if (resourceUrlPattern === PULL_REQUEST_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_PULL_REQUEST_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(read)),
       };
     }
 
@@ -1579,11 +1801,8 @@ export interface GitHubVerifierApi extends GatekeeperUserVerifier {
 export class GitHubVerifier extends WorkerEntrypoint<Env, GitHubVerifierProps>
     implements GitHubVerifierApi {
   async hasRepoAccess(owner: string, repo: string): Promise<boolean> {
-    const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
-    const account = this.ctx.exports.UserAccount.get(id);
-    const api = new GitHubApi(async () => await account.getAccessToken());
     try {
-      await api.getRepo(owner, repo);
+      await accountReader(this.ctx.exports, this.ctx.props.userObjectId)(api => api.getRepo(owner, repo));
       return true;
     } catch (error) {
       // GitHub returns 404 for private repos the token cannot see (to avoid leaking existence), and
@@ -1617,17 +1836,16 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async #withApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
-    const account = this.#userAccount();
-    const api = new GitHubApi(async () => await account.getAccessToken());
-    try {
-      return await fn(api);
-    } catch (error) {
-      if (error instanceof GitHubApiError && error.isAuthError) {
-        await account.noteCredentialsExpired();
-        throw new Error("GitHub credentials have expired or been revoked. Please reconnect the account.", { cause: error });
-      }
-      throw error;
-    }
+    return await withAccountApi(this.#userAccount(), fn);
+  }
+
+  /**
+   * `#withApi` for reads safe to send twice: a token a refresh replaced in flight reruns `fn` once
+   * instead of failing. An apply's follow-up reads need this, since failing them after GitHub
+   * accepted the mutation leaves the action pending, and retrying it repeats the mutation.
+   */
+  async #readApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
+    return await withAccountApi(this.#userAccount(), fn, { replayable: true });
   }
 
   #counterKey(name: string): string {
@@ -1993,7 +2211,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     let changedCount = 0;
 
     for (let page = 1; ; page += 1) {
-      const batch = await this.#withApi(api =>
+      const batch = await this.#readApi(api =>
         api.listPullRequestReviewComments(
           this.ctx.props.owner,
           this.ctx.props.repo,
@@ -3280,7 +3498,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       cacheKey,
       ENTITY_CACHE_TTL_MS,
       async etag => {
-        const firstPage = await this.#withApi(api =>
+        const firstPage = await this.#readApi(api =>
           api.listReviewCommentsForReviewConditional(
             this.ctx.props.owner,
             this.ctx.props.repo,
@@ -3298,7 +3516,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         const results = [...firstPage.data];
         if (firstPage.data.length === 100) {
           const rest = await this.#fetchAllPages((page, perPage) =>
-            this.#withApi(api =>
+            this.#readApi(api =>
               api.listReviewCommentsForReview(
                 this.ctx.props.owner,
                 this.ctx.props.repo,
@@ -3560,11 +3778,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async submitActionForApproval(
     approvalQueue: RpcStub<ApprovalQueue>,
     action: GitHubAction,
-    description: ActionDescription,
+    presentation: { title: string; implementsRevert: boolean; pushedCommits?: string[] },
   ): Promise<void> {
     this.#stageAction(action);
     try {
-      await approvalQueue.submitAction(action.approvalId, description);
+      // The text comes from the staged payload, not the caller, so it always shows what applies.
+      await approvalQueue.submitAction(action.approvalId, {
+        ...presentation,
+        ...describeGitHubAction(action),
+      });
     } catch (error) {
       this.ctx.storage.kv.delete(this.#actionRecordKey(action.approvalId));
       this.#pendingActionsCache = undefined;
@@ -3691,12 +3913,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "removeLabels": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
         if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
-        await this.#withApi(api => {
-          const remainingLabels = action.previousLabels.filter(
-            label => !action.labels.some(removed => removed.toLowerCase() === label.toLowerCase()),
-          );
-          return api.setLabels(action.owner, action.repo, Number(realId), remainingLabels);
-        });
+        await this.#withApi(api =>
+          api.setLabels(action.owner, action.repo, Number(realId), remainingLabels(action)));
         this.#markActionApproved(action);
         this.#clearCaches();
         return;
@@ -5207,43 +5425,31 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
     const action = await this.#gatekeeper.prepareCreateIssue(options);
     await this.#gatekeeper.submitActionForApproval(this.#approvalQueue, action, {
       title: `Create issue ${options.title}`,
-      description: `Create a new issue in ${action.owner}/${action.repo} titled "${options.title}".`,
       implementsRevert: false,
     });
     return new GitHubIssueImpl(this.#gatekeeper, this.#approvalQueue.dup(), action.provisionalId, "issue");
   }
 
   async createPullRequest(options: GitHubCreatePullRequestOptions): Promise<GitHubPullRequest> {
-    // Queue-time validation reads both branches' current heads (see prepareCreatePullRequest).
-    await this.#approvalQueue.authorizeObservation({
-      title: `Read heads of branches ${options.head} and ${options.base}`,
-      description: `Read the current heads of branches "${options.head}" and "${options.base}" ` +
-        `in order to create a pull request from one into the other.`,
-    });
     const action = await this.#gatekeeper.prepareCreatePullRequest(options);
     await this.#gatekeeper.submitActionForApproval(this.#approvalQueue, action, {
       title: `Create pull request ${options.title}`,
-      description: `Create a new pull request in ${action.owner}/${action.repo} from ${options.head} into ${options.base}.`,
       implementsRevert: false,
     });
     return new GitHubPullRequestImpl(this.#gatekeeper, this.#approvalQueue.dup(), action.provisionalId);
   }
 
+  /**
+   * Opening a capability is not an observation: the caller learns only that the number exists,
+   * and the returned stub's getDetails() records the actual read.
+   */
   async getIssue(id: string): Promise<GitHubIssue> {
-    const details = await this.#gatekeeper.openIssue(id);
-    await this.#approvalQueue.authorizeObservation({
-      title: `Open issue #${details.id}: ${details.title}`,
-      description: `Open a capability for issue #${details.id} in ${details.repo.fullName}.`,
-    });
+    await this.#gatekeeper.openIssue(id);
     return new GitHubIssueImpl(this.#gatekeeper, this.#approvalQueue.dup(), id, "issue");
   }
 
   async getPullRequest(id: string): Promise<GitHubPullRequest> {
-    const details = await this.#gatekeeper.openPullRequest(id, await this.#gitCache.stub());
-    await this.#approvalQueue.authorizeObservation({
-      title: `Open pull request #${details.id}: ${details.title}`,
-      description: `Open a capability for pull request #${details.id} in ${details.repo.fullName}.`,
-    });
+    await this.#gatekeeper.openPullRequest(id, await this.#gitCache.stub());
     return new GitHubPullRequestImpl(this.#gatekeeper, this.#approvalQueue.dup(), id);
   }
 
@@ -5356,22 +5562,11 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
         `push() requires a full 40-character commit id; got ${JSON.stringify(commitId)}. ` +
         `Use resolveRef() to resolve a truncated id.`);
     }
-    // Binding the push's expected old head reads the branch's current state.
-    await this.#approvalQueue.authorizeObservation({
-      title: `Read head of branch ${branch}`,
-      description: `Read the current head of branch "${branch}" in order to push to it.`,
-    });
     const action = await this.#gatekeeper.preparePush(
       branch, commitId, options?.force ?? false, await this.#gitCache.stub());
     if (action === null) return;  // the branch is already at commitId: nothing to do
-    const creating = action.expectedOldSha === ZERO_OID;
     await this.#gatekeeper.submitActionForApproval(this.#approvalQueue, action, {
       title: `Push ${commitId.slice(0, 12)} to ${branch}`,
-      description: creating
-        ? `Push commit ${commitId} to ${action.owner}/${action.repo}, creating branch "${branch}".`
-        : `Push commit ${commitId} to branch "${branch}" of ${action.owner}/${action.repo}, ` +
-          `moving the branch from its current head ${action.expectedOldSha}.` +
-          (action.force ? " This is a force push: it rewrites the branch's history." : ""),
       pushedCommits: [commitId],
       implementsRevert: true,
     });
@@ -5416,13 +5611,6 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
     (this.approvalQueue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
   }
 
-  protected async authorizeMutationPreparation(action: string): Promise<void> {
-    await this.approvalQueue.authorizeObservation({
-      title: `Read current state of #${this.logicalId}`,
-      description: `Read the current state of #${this.logicalId} in order to ${action} and capture revert information.`,
-    });
-  }
-
   async getDetails(): Promise<GitHubIssueDetails> {
     const details = await this.gatekeeper.openIssue(this.logicalId);
     await this.approvalQueue.authorizeObservation({
@@ -5433,61 +5621,49 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async setTitle(title: string): Promise<void> {
-    await this.authorizeMutationPreparation("change its title");
     const action = await this.gatekeeper.prepareSetTitle(this.kind, this.logicalId, title);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Rename #${this.logicalId}`,
-      description: `Change the title from "${action.previousTitle}" to "${title}".`,
       implementsRevert: true,
     });
   }
 
   async setBody(bodyMarkdown: string): Promise<void> {
-    await this.authorizeMutationPreparation("edit its body");
     const action = await this.gatekeeper.prepareSetBody(this.kind, this.logicalId, bodyMarkdown);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Edit body of #${this.logicalId}`,
-      description: `Replace the Markdown body of #${this.logicalId}.`,
       implementsRevert: true,
     });
   }
 
   async addLabels(labels: string[]): Promise<void> {
-    await this.authorizeMutationPreparation("add labels");
     const action = await this.gatekeeper.prepareAddLabels(this.kind, this.logicalId, labels);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Add labels to #${this.logicalId}`,
-      description: `Add labels ${labels.join(", ")} to #${this.logicalId}.`,
       implementsRevert: true,
     });
   }
 
   async removeLabels(labels: string[]): Promise<void> {
-    await this.authorizeMutationPreparation("remove labels");
     const action = await this.gatekeeper.prepareRemoveLabels(this.kind, this.logicalId, labels);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Remove labels from #${this.logicalId}`,
-      description: `Remove labels ${labels.join(", ")} from #${this.logicalId}.`,
       implementsRevert: true,
     });
   }
 
   async close(reason?: "completed" | "notPlanned"): Promise<void> {
-    await this.authorizeMutationPreparation("close it");
     const action = await this.gatekeeper.prepareChangeState(this.kind, this.logicalId, "closed", reason);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Close #${this.logicalId}`,
-      description: `Close #${this.logicalId}${reason ? ` with reason ${reason}` : ""}.`,
       implementsRevert: true,
     });
   }
 
   async reopen(): Promise<void> {
-    await this.authorizeMutationPreparation("reopen it");
     const action = await this.gatekeeper.prepareChangeState(this.kind, this.logicalId, "open");
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Reopen #${this.logicalId}`,
-      description: `Reopen #${this.logicalId}.`,
       implementsRevert: true,
     });
   }
@@ -5504,7 +5680,6 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
     const action = await this.gatekeeper.preparePostComment(this.kind, this.logicalId, bodyMarkdown);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Comment on #${this.logicalId}`,
-      description: `Post a new Markdown comment on #${this.logicalId}.`,
       implementsRevert: true,
     });
   }
@@ -5592,7 +5767,6 @@ export class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPull
     const action = await this.gatekeeper.preparePostReview(this.logicalId, review);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Submit review for #${this.logicalId}`,
-      description: `Submit a ${review.decision} review for pull request #${this.logicalId}.`,
       implementsRevert: false,
     });
   }
@@ -5606,7 +5780,6 @@ export class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPull
     const action = await this.gatekeeper.prepareReplyToDiffComment(this.logicalId, commentId, bodyMarkdown);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Reply to diff thread on #${this.logicalId}`,
-      description: `Reply to a diff discussion thread on pull request #${this.logicalId}.`,
       implementsRevert: true,
     });
   }
@@ -5615,7 +5788,6 @@ export class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPull
     const action = await this.gatekeeper.prepareMergePullRequest(this.logicalId, options);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Merge pull request #${this.logicalId}`,
-      description: `Merge pull request #${this.logicalId}${options?.method ? ` using ${options.method}` : ""}.`,
       implementsRevert: false,
     });
   }
