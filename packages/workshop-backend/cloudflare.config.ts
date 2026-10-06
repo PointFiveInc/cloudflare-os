@@ -65,6 +65,14 @@ export default defineGadgetsWorker({
 export const wrangler = {
   build: { command: "pnpm run build:worker", watch_dir: "src" },
   kvPreviewIds: { BLUEPRINTS: "gadgets-blueprint-metadata", AVATARS: "gadgets-avatars" },
+  // `esbuild.wasm` is imported for its BYTES, not as a compiled module: the Gadget client
+  // bundler runs in a Dynamic Worker, and `WorkerLoaderModule.wasm` takes an ArrayBuffer. A
+  // compiled `WebAssembly.Module` cannot cross that boundary at all ("Unable to deserialize
+  // cloned data"), so the default CompiledWasm rule is wrong here. Carrying bytes also keeps the
+  // 14 MB module out of this Worker's own startup: the loader compiles it inside the bundler's
+  // isolate, on first use. `fallthrough` so wrangler's own default Data rule (`**/*.bin`) still
+  // applies; a rule without it shadows the defaults for that type entirely.
+  rules: [{ type: "Data", globs: ["**/esbuild.wasm"], fallthrough: true }],
 } satisfies WranglerExtras;
 
 export const migrations: DurableObjectMigration[] = [
