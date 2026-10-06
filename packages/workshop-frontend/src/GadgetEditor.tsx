@@ -70,6 +70,7 @@ import { reportIssue } from './errorReporting'
 import GadgetExportMenu from './GadgetExportMenu'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './components/menuStyles'
 import { isImeComposing } from './keyboardEvent'
+import { GadgetFullscreenExitButton, useCoarsePointer } from './GadgetFullscreenExit'
 
 const NO_GADGETS: ReadonlySet<WorkpieceId> = new Set()
 
@@ -561,6 +562,7 @@ export default function GadgetEditor() {
   const [isGadgetFullscreen, setIsGadgetFullscreen] = useState(
     () => typeof window !== 'undefined' && window.location.hash === '#fullscreen'
   )
+  const coarsePointer = useCoarsePointer()
 
   useEffect(() => {
     const onHashChange = () => {
@@ -2040,7 +2042,10 @@ export default function GadgetEditor() {
               ) : !previewMode && (
                 <NoGadgetPlaceholder height="100%" />
               )}
-              {isGadgetFullscreen && showFullscreenHint && (
+              {isGadgetFullscreen && coarsePointer && (
+                <GadgetFullscreenExitButton onExit={exitGadgetFullscreen} />
+              )}
+              {isGadgetFullscreen && showFullscreenHint && !coarsePointer && (
                 <div
                   role="status"
                   aria-live="polite"
