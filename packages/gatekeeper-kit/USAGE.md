@@ -76,6 +76,20 @@ return htmlResponse(connectHandoffPageHtml(handoff));
 Without `ifGeneration`, `connect()` writes unconditionally. That remains appropriate for a pasted
 token or form submission with no round trip to fence.
 
+Call `complete()` at most once per account. Each call stages another Workshop ticket, and an
+unredeemed ticket revokes the account, so a second call can destroy the connection the first made,
+even one that threw or lost its reply. A flow that claimed a single-use nonce reaches `complete()`
+once already. A flow whose link or form has no single-use nonce records the attempt: refuse when
+`isConnectAttempted(kv)` (early, to skip provider work, and again where the live credential is
+written), then mark it in that same synchronous section:
+
+```ts
+if (isConnectAttempted(kv)) return refuse();
+this.#creds.connect(grant);
+markConnectAttempted(kv);
+const handoff = await callback.complete(user, credentialsRefreshabilityExpiry);
+```
+
 RPC rejection does not prove that `complete()` failed. Workshop may already hold a pending handoff,
 or a sign-in may already have linked the account, so a blind rollback can delete credentials the
 Workshop is about to activate. The kit has no mechanism for this. An account that keeps its grant
@@ -541,6 +555,38 @@ provider" warning survives.
 substitutes for a provider idempotency key derived from the stable `ActionContext.id`, which is
 what makes a retry safe in the first place.
 
+### Describe with `buildDescription`
+
+Write `describe` with `buildDescription` from `@gadgets/gatekeeper-kit/action-description`. The
+approver vouches for the text they read, so every piece of content the action will send that came
+from the workspace — a body, a field value, an identifier, serialized arguments — goes in a field
+(`inline`, `verbatim`, `json`, `list`, or `file`). Fields travel as `ActionDescription.fields`,
+which approval surfaces show as literal text, so nothing in a value renders as Markdown. A value a
+field cannot show exactly, such as one with invisible characters, is shown as escaped JSON instead.
+Prose is for the gatekeeper's own summary: never interpolate agent- or provider-supplied text into
+it, since such text can open an HTML block the chat hides. Put the value in a field, or pass a mere
+label through `codeSpan` or `plainInline`. Spread `finish()` into the presentation and never set
+`descriptionIsComplete` by hand: the builder sets it only when every field was shown in full under
+its 96 KiB budget, and leaves the key off after truncating or omitting one, or when prose alone
+overflows it. An incomplete description is still submitted, and the approver is told part of the
+action isn't shown.
+
+```ts
+describe: payload => ({
+  title: `Comment on issue ${payload.issueId}`,
+  ...buildDescription("Posts a comment on an issue.")
+    .inline("Issue", payload.issueId)
+    .verbatim("Comment", payload.body)
+    .finish(),
+  implementsRevert: false,
+}),
+```
+
+Bytes the approver cannot read as text — an agent-supplied file, git objects — cannot be complete.
+Name a file with `file(label, {name, mediaType, size, sha256, origin})`: `origin: "agent"` leaves
+the flag off, while `origin: "provider"`, for bytes re-sent unchanged from the same provider such as
+a forwarded attachment, keeps it on.
+
 Store action file bytes with `ActionFileStore`. Put only the bounded `ActionFileReference` in the
 action payload. Journal records must stay small, and approval text must describe the same bytes that
 will be applied.
@@ -779,8 +825,9 @@ cannot exceed the provider's page cap.
 - Use `isNoAccessError` or `probeAccess` for observer ACL checks. Do not use `isNoAccessError` as
   `CredentialSource.isAuthError`; it accepts 403 and 404.
 - Use `readTextCapped` for every textual, JSON, or error body — a provider can return more bytes
-  than the Worker can hold. It decodes UTF-8 and buffers, so binary downloads and streaming
-  protocols (SSE, Git) need their own byte-preserving limit instead.
+  than the Worker can hold — and for a connect form read before its nonce is checked. It decodes
+  UTF-8 and buffers, so binary downloads and streaming protocols (SSE, Git) need their own
+  byte-preserving limit instead.
 - Use `normalizeVendorEndpoint` for user-supplied provider base URLs. It validates that one URL and
   is not a fetch policy: fetch with `redirect: "manual"`, or re-validate each `Location` and drop
   origin-scoped headers when the origin changes, or a redirect carries `Authorization` off the

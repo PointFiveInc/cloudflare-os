@@ -64,14 +64,19 @@ export class GadgetBundleError extends Error {
 }
 
 /**
- * Whether `source` could possibly contain a module import: any `import` or `export` token at all.
- * Deliberately crude, and safe in the direction that matters -- every real static or dynamic
- * import contains one of those two words, so a false negative (skipping a build that was needed)
- * is not reachable, while a false positive (a mention in a comment or a string) costs one cheap
- * build whose single-input result is discarded in favour of the original source anyway.
+ * Whether `source` could possibly pull in another module: an `import` token anywhere, or an
+ * `export` token together with a `from` (a re-export, `export ... from "./x.js"`). Deliberately
+ * crude, and safe in the direction that matters -- every real static or dynamic import contains
+ * `import` and every re-export contains both `export` and `from`, so a false negative (skipping a
+ * build that was needed) is not reachable, while a false positive (a mention in a comment or a
+ * string) costs one cheap build whose single-input result is discarded in favour of the original
+ * source anyway.
+ *
+ * A bare `export` is not enough: a client.js that only exports imports nothing, so the build
+ * could only hand back its own bytes.
  */
 function mightImport(source: string): boolean {
-  return /\b(?:import|export)\b/.test(source);
+  return /\bimport\b/.test(source) || (/\bexport\b/.test(source) && /\bfrom\b/.test(source));
 }
 
 /**

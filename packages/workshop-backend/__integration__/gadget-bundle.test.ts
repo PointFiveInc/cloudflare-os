@@ -46,6 +46,20 @@ describe("bundleGadgetClient", () => {
     expect(await bundle({"client.js": source})).toBe(source);
   });
 
+  it("never starts the bundler for a client.js that exports but imports nothing", async () => {
+    // Upstream's integration harness boots the Workshop without a Worker Loader and serves such
+    // UIs; they must keep loading there. A re-export, though, is an import and must be built.
+    const noBundler = {
+      get() { throw new Error("the bundler was started"); },
+    } as unknown as WorkerLoader;
+    const bundleWithout = (source: string) =>
+      bundleGadgetClient(noBundler, "gadget-bundle-test", new Map([["client.js", source]]));
+    let source = `export default "mainline";\n`;
+    expect(await bundleWithout(source)).toBe(source);
+    await expect(bundleWithout(`export {x} from "./x.js";`))
+        .rejects.toThrow("the bundler was started");
+  });
+
   it("returns source verbatim when a build finds no imports after all", async () => {
     // The crude `mightImport` scan sends this to the bundler because of the word in the string,
     // and the single-input metafile check is what still hands back the original bytes.
