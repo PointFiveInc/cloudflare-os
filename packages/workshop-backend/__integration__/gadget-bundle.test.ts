@@ -5,7 +5,8 @@
 // Integration rather than unit: the unit config (vitest.config.ts) builds its miniflare options
 // inline and has no `worker_loaders`, so `env.LOADER` only exists here, where the pool reads the
 // real wrangler.jsonc.
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
+import { exports } from "cloudflare:workers";
 import { GadgetBundleError, bundleGadgetClient } from "../src/gadget-bundle";
 import { describe, expect, it } from "vitest";
 
@@ -184,5 +185,43 @@ describe("bundleGadgetClient", () => {
   it("fails cleanly for a Gadget with no client.js", async () => {
     expect(await bundleError({"server.js": `export class Gadget {}`}))
         .toContain("has no client.js");
+  });
+});
+
+// Upstream's getGadgetUiBundle returns client.js verbatim. A merge that keeps upstream's side of
+// it would leave every test above green while multi-file Gadget UIs stop loading.
+describe("getGadgetUiBundle", () => {
+  it("serves a multi-file Gadget's UI bundled", async () => {
+    const stub = exports.OverseerDurableObject.getByName("gadget-bundle-test");
+    await runInDurableObject(stub, async (instance) => {
+      const impl = (instance as unknown as { impl: any }).impl;
+      const commitId = await impl.gitStore.writeFilesAsCommit(new Map([
+        ["client.js", `import {greet} from "./helper.js";\ndocument.body.textContent = greet("x");`],
+        ["helper.js", `export function greet(name) { return "hello " + name; }`],
+        ["server.js", `export class Gadget {}`],
+      ]), {
+        parents: [],
+        author: { name: "Test", email: "test@example.com" },
+        message: "multi-file gadget",
+        timestamp: new Date(0),
+      });
+      const gadget = impl.createGadget("Gadget", "BUNDLED", undefined, undefined, commitId);
+
+      const { jsCode } = await impl.getGadgetUiBundle(gadget.id);
+      expect(jsCode).toContain(`"hello " + name`);
+      expect(jsCode).not.toContain(`from "./helper.js"`);
+    });
+  });
+});
+
+// The bundler hands esbuild.wasm to the Worker Loader, which in production accepts it only as
+// bytes: a compiled WebAssembly.Module fails with "Unable to deserialize cloned data". Local
+// workerd accepts either, so the bundling tests above pass without wrangler.jsonc's Data rule for
+// esbuild.wasm; this one does not. The pool loads modules by that file's rules, as wrangler does.
+describe("wrangler.jsonc module rules", () => {
+  it("load esbuild.wasm as bytes, not as a compiled module", async () => {
+    const { default: wasm } = await import("esbuild-wasm/esbuild.wasm");
+    expect(wasm).toBeInstanceOf(ArrayBuffer);
+    expect([...new Uint8Array(wasm, 0, 4)]).toEqual([0x00, 0x61, 0x73, 0x6d]);
   });
 });
