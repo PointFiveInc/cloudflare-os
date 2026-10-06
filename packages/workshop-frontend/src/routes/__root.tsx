@@ -39,7 +39,7 @@ function RootComponent() {
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
-  const isWorkspaceEditor = pathname.startsWith('/workspace/') || pathname.startsWith('/gadget/')
+  const isWorkspaceEditor = pathname.startsWith('/workspace/') || pathname.startsWith('/gadget/') || pathname.startsWith('/apps/')
 
   const handleLoginSuccess = () => {
     const token = localStorage.getItem('authToken')
