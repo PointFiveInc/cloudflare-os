@@ -67,11 +67,15 @@ const USE_SURFACE = new Set(['subscribeToMetadata', 'subscribeToWorkpieces', 'ge
 
 type FakeWorkspace = {
   role?: CollaboratorRole
+  // Set only for a collaborator, as the backend reports it.
+  ownerName?: string
   workpieces?: WorkpieceSummary[]
   openError?: Error
 }
 
-const fakeAuthenticatedApi = ({ role, workpieces = [gadgetSummary(0)], openError }: FakeWorkspace) => {
+const fakeAuthenticatedApi = (
+  { role, ownerName, workpieces = [gadgetSummary(0)], openError }: FakeWorkspace,
+) => {
   const calledMethods = new Set<string>()
   const overseer = new Proxy({} as Record<string | symbol, unknown>, {
     get: (_target, property) => {
@@ -82,7 +86,8 @@ const fakeAuthenticatedApi = ({ role, workpieces = [gadgetSummary(0)], openError
         case 'subscribeToMetadata':
           return async (onMetadata: (metadata: unknown) => void) => {
             if (openError) throw openError
-            onMetadata({ id: 'ws', title: 'Workspace', role })
+            const owner = ownerName === undefined ? undefined : { type: 'user', id: 'owner', name: ownerName }
+            onMetadata({ id: 'ws', title: 'Workspace', role, owner })
             return disposable()
           }
         case 'subscribeToWorkpieces':
@@ -129,9 +134,14 @@ const renderAt = async (url: string) => {
     path: '/workspaces',
     component: () => <div data-testid="workspaces" />,
   })
+  const editorRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/workspace/$id',
+    component: () => <div data-testid="editor" />,
+  })
   const router = createRouter({
     history: createBrowserHistory(),
-    routeTree: rootRoute.addChildren([appsRoute, workspacesRoute]),
+    routeTree: rootRoute.addChildren([appsRoute, workspacesRoute, editorRoute]),
   })
   container = document.createElement('div')
   document.body.append(container)
@@ -242,5 +252,58 @@ describe('GadgetAppView', () => {
 
     expect(openGadget).toHaveBeenCalledTimes(1)
     expect(testState.gadgetUiMounts).toBe(1)
+  })
+})
+
+const ROLES: { name: string; workspace: FakeWorkspace; owner: string; canEdit: boolean }[] = [
+  { name: 'owner', workspace: { role: 'build' }, owner: 'by you', canEdit: true },
+  { name: 'build', workspace: { role: 'build', ownerName: 'Olive Owner' }, owner: 'by Olive Owner', canEdit: true },
+  { name: 'use', workspace: { role: 'use', ownerName: 'Olive Owner' }, owner: 'by Olive Owner', canEdit: false },
+]
+
+const workshopButton = (page: HTMLElement) =>
+  page.querySelector<HTMLButtonElement>('nav[aria-label="Workshop"] button[aria-label^="Workshop:"]')
+
+const openMenu = async (page: HTMLElement) => {
+  await act(async () => workshopButton(page)!.click())
+  return [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+}
+
+describe('Workshop button', () => {
+  it.each(ROLES)('names the gadget and its owner for the $name', async ({ workspace, owner }) => {
+    fakeAuthenticatedApi(workspace)
+    const { page } = await renderAt('/apps/ws/0/a')
+
+    const button = workshopButton(page)
+    expect(button?.textContent).toContain('Gadget 0')
+    expect(button?.textContent).toContain(owner)
+  })
+
+  it.each(ROLES)('offers the editor only to people who may edit, here the $name', async ({ workspace, canEdit }) => {
+    fakeAuthenticatedApi(workspace)
+    const { page } = await renderAt('/apps/ws/0/a')
+
+    const items = await openMenu(page)
+    expect(items.map(item => item.textContent)).toEqual(
+      canEdit ? ['Back to Workshop', 'Open in editor'] : ['Back to Workshop'],
+    )
+    await act(async () => items.at(-1)!.click())
+    await settle()
+    expect(currentUrl()).toBe(canEdit ? '/workspace/ws?w=0' : '/workspaces')
+  })
+
+  it('sits in its own strip above the frame, never inside the frame\'s bounds', async () => {
+    fakeAuthenticatedApi({ role: 'use', ownerName: 'Olive Owner' })
+    const { page } = await renderAt('/apps/ws/0/a')
+
+    const button = workshopButton(page)!
+    const strip = button.closest('nav')!
+    const frameArea = page.querySelector('[data-testid="gadget-ui"]')!.parentElement!
+    const layout = strip.parentElement!
+    expect(frameArea.parentElement).toBe(layout)
+    expect(layout.style.gridTemplateRows).toBe('44px minmax(0, 1fr)')
+    expect(strip.style.gridRow).toBe('1')
+    expect(frameArea.style.gridRow).toBe('2')
+    expect(frameArea.contains(button)).toBe(false)
   })
 })

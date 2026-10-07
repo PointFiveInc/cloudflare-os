@@ -13,11 +13,16 @@ import type {
 import { useAuthenticatedApi } from './AuthContext'
 import GadgetUI from './GadgetUI'
 import GadgetExportMenu from './GadgetExportMenu'
+import AppWorkshopButton from './AppWorkshopButton'
 import ObserverConfigModal from './ObserverConfigModal'
 import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
 import { WorkshopButton } from './components/WorkshopControls'
 import type { AppLocation } from './appLocation'
 import { useWorkspaceOpen } from './useWorkspaceOpen'
+
+// The Workshop's strip across the top of every app page. The gadget's frame starts below it, so no
+// gadget can cover the Workshop button, which keeps this height and the strip's right-hand corner.
+const APP_BAR_HEIGHT = 44
 
 // A gadget still pending in a chat is that chat's draft, so only accepted gadgets have an app page.
 const isAppGadget = (summary: WorkpieceSummary): summary is GadgetSummary =>
@@ -113,9 +118,9 @@ type Props = {
 }
 
 /**
- * The app page: one gadget and nothing of the Workshop around it, the same for owner, build and
- * use. It opens through the same `openGadget()` as the workspace page, so Access, the sharing graph
- * and observer checks apply unchanged.
+ * The app page: one gadget under a slim Workshop strip that holds only the Workshop button and the
+ * export menu, the same for owner, build and use. It opens through the same `openGadget()` as the
+ * workspace page, so Access, the sharing graph and observer checks apply unchanged.
  */
 const GadgetAppView = ({ location, onShareKeyConsumed }: Props) => {
   const navigate = useNavigate()
@@ -132,6 +137,11 @@ const GadgetAppView = ({ location, onShareKeyConsumed }: Props) => {
   })
   const gadget = useAppGadget(workspace.overseer?.stub ?? null, location.gadgetId)
   const goToWorkspaces = () => navigate({ to: '/workspaces' })
+  const openEditor = () => navigate({
+    to: '/workspace/$id',
+    params: { id: location.workspaceId },
+    search: { w: location.gadgetId ?? undefined },
+  })
 
   if (workspace.error?.kind === 'open') {
     return (
@@ -167,20 +177,38 @@ const GadgetAppView = ({ location, onShareKeyConsumed }: Props) => {
     )
   }
 
+  const metadata = workspace.metadata
   return (
-    <div className="relative h-full overflow-hidden bg-kumo-base">
-      {gadget.status === 'ready' ? (
-        <>
-          <GadgetUI gadget={gadget.client} height="100%" />
-          <div className="absolute right-3 top-3">
+    <div
+      className="grid h-full overflow-hidden bg-kumo-base"
+      style={{ gridTemplateRows: `${APP_BAR_HEIGHT}px minmax(0, 1fr)` }}
+    >
+      <nav
+        aria-label="Workshop"
+        className="flex min-w-0 items-center justify-end gap-1 border-b border-kumo-line px-2"
+        style={{ gridRow: 1 }}
+      >
+        {gadget.status === 'ready' && metadata && (
+          <>
             <GadgetExportMenu gadget={gadget.client} gadgetTitle={gadget.title} />
+            <AppWorkshopButton
+              gadgetTitle={gadget.title}
+              ownerName={metadata.owner?.name ?? null}
+              onBackToWorkshop={goToWorkspaces}
+              onOpenEditor={metadata.role === 'use' ? undefined : openEditor}
+            />
+          </>
+        )}
+      </nav>
+      <div className="min-h-0" style={{ gridRow: 2 }}>
+        {gadget.status === 'ready' ? (
+          <GadgetUI gadget={gadget.client} height="100%" />
+        ) : (
+          <div className="flex h-full items-center justify-center">
+            <div className="h-8 w-8 animate-spin rounded-full border-2 border-kumo-brand border-t-transparent" />
           </div>
-        </>
-      ) : (
-        <div className="flex h-full items-center justify-center">
-          <div className="h-8 w-8 animate-spin rounded-full border-2 border-kumo-brand border-t-transparent" />
-        </div>
-      )}
+        )}
+      </div>
       {workspace.observerConfig && (
         <ObserverConfigModal
           needs={workspace.observerConfig.needs}
