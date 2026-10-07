@@ -19,6 +19,7 @@ import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
 import { WorkshopButton } from './components/WorkshopControls'
 import type { AppLocation } from './appLocation'
 import { useWorkspaceOpen } from './useWorkspaceOpen'
+import { useSiteName } from './ServerConfigContext'
 
 // The Workshop's strip across the top of every app page. The gadget's frame starts below it, so no
 // gadget can cover the Workshop button, which keeps this height and the strip's right-hand corner.
@@ -114,6 +115,10 @@ const useAppGadget = (
 
 type Props = {
   location: AppLocation
+  /** The app page's address without an inner path. */
+  appUrl: string
+  /** Moves the address bar to another inner path of this gadget. */
+  onNavigate: (innerPath: string, replace: boolean) => void
   onShareKeyConsumed: () => void
 }
 
@@ -122,7 +127,7 @@ type Props = {
  * export menu, the same for owner, build and use. It opens through the same `openGadget()` as the
  * workspace page, so Access, the sharing graph and observer checks apply unchanged.
  */
-const GadgetAppView = ({ location, onShareKeyConsumed }: Props) => {
+const GadgetAppView = ({ location, appUrl, onNavigate, onShareKeyConsumed }: Props) => {
   const navigate = useNavigate()
   const toasts = useKumoToastManager()
   const { authenticatedApi } = useAuthenticatedApi()
@@ -136,6 +141,22 @@ const GadgetAppView = ({ location, onShareKeyConsumed }: Props) => {
     },
   })
   const gadget = useAppGadget(workspace.overseer?.stub ?? null, location.gadgetId)
+  const [titleText, setTitleText] = useState('')
+  const siteName = useSiteName()
+  // The gadget's title always follows its text, so a tab never shows only what the gadget chose.
+  const tabTitle = gadget.status === 'ready'
+    ? `${titleText ? `${titleText} – ` : ''}${gadget.title} - ${siteName}`
+    : null
+  // useWorkspaceOpen titles the tab with the workspace whenever its metadata changes, so this runs
+  // again after it and takes the tab back for the gadget.
+  useEffect(() => {
+    if (tabTitle === null) return
+    const previous = document.title
+    document.title = tabTitle
+    return () => {
+      document.title = previous
+    }
+  }, [tabTitle, workspace.metadata])
   const goToWorkspaces = () => navigate({ to: '/workspaces' })
   const openEditor = () => navigate({
     to: '/workspace/$id',
@@ -202,7 +223,11 @@ const GadgetAppView = ({ location, onShareKeyConsumed }: Props) => {
       </nav>
       <div className="min-h-0" style={{ gridRow: 2 }}>
         {gadget.status === 'ready' ? (
-          <GadgetUI gadget={gadget.client} height="100%" />
+          <GadgetUI
+            gadget={gadget.client}
+            height="100%"
+            app={{ path: location.innerPath, appUrl, onNavigate, onSetTitle: setTitleText }}
+          />
         ) : (
           <div className="flex h-full items-center justify-center">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-kumo-brand border-t-transparent" />

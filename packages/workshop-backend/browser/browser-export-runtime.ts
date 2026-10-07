@@ -1,4 +1,5 @@
 import { RpcSession, RpcStub, RpcTarget, type RpcTransport } from "capnweb";
+import { installExportWorkshop } from "./export-workshop";
 
 // This code runs in the main world of the remote browser used for rendering the
 // Gadget UI for export. It runs before the Gadget client module is loaded and
@@ -69,6 +70,8 @@ globalThis.__workshopExportRuntime = {
   RpcStub,
   RpcTarget,
 };
+
+installExportWorkshop(globalThis);
 
 const clientUrl = globalThis.__workshopExportClientUrl;
 delete (globalThis as Partial<typeof globalThis>).__workshopExportClientUrl;

@@ -3,6 +3,7 @@ import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
 import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
+import { useWorkshopBridge, WORKSHOP_FRAME, type AppPageRoute } from './workshopBridge'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -29,7 +30,7 @@ let gadget;  // RPC stub to the gadget's server-side Durable Object.
 {
   let {port1, port2} = new MessageChannel();
   window.parent.postMessage("handshake", "*", [port2]);
-  gadget = newMessagePortRpcSession(port1);
+  gadget = newMessagePortRpcSession(port1, ${WORKSHOP_FRAME});
 }
 
 // Monkey-patch console to forward logs to the parent frame.
@@ -128,6 +129,8 @@ interface GadgetUIProps {
   // Reports whether the "No gadget UI yet" placeholder is showing: true only once a load has
   // confirmed the gadget has no UI, so a spinner or a not-yet-loaded view never counts.
   onNoUiChange?: (showsNoUi: boolean) => void
+  // Set on the gadget's app page, where `workshop.location.path` is the address bar's inner path.
+  app?: AppPageRoute
 }
 
 // How long to wait for a UI bundle before offering a retry instead of a spinner. Not a latency
@@ -139,7 +142,8 @@ export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={props.chatId} {...props} />
 }
 
-function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange }: GadgetUIProps) {
+function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, app }: GadgetUIProps) {
+  const workshopBridge = useWorkshopBridge(app)
   const [sandboxedHtml, setSandboxedHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -382,6 +386,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
             },
           })
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)
+          workshopBridge.attach(rpcSessionRef.current)
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
