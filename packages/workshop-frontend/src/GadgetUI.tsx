@@ -524,6 +524,8 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         // iframe over the capnweb MessagePort, not fetch(), so the CSP's connect-src 'none'
         // above is not in this path and stays as-is.
         sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads"
+        // Write only: a gadget's Copy button works, and it never reads what the user copied elsewhere.
+        allow="clipboard-write"
         title="Gadget UI"
       />
     </div>
