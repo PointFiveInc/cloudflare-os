@@ -3,7 +3,7 @@ import type { GatekeeperAppInfo } from '@gadgets/workshop-shared/api'
 import { useOptionalAuthenticatedApi } from './AuthContext'
 
 // Shared per-API-stub cache of the listGatekeeperApps() request, so multiple callers in one render
-// cycle (e.g. the Header nav and the /gatekeepers/$appId page) share a single RPC instead of each
+// cycle (e.g. the /gatekeepers page and the /gatekeepers/$appId page) share a single RPC instead of each
 // firing their own. Keyed weakly by the stub, so it's dropped when the authenticated session ends.
 const appsRequestByApi = new WeakMap<object, Promise<GatekeeperAppInfo[]>>()
 
@@ -22,8 +22,8 @@ export function refreshGatekeeperApps(api: object): void {
 
 /**
  * The gatekeeper-served management apps available to the current user (one per gatekeeper that sets
- * `providesUi`, e.g. the Context Library). The Workshop hosts each at `/gatekeepers/$appId` and lists
- * them in the nav — no gatekeeper is hardcoded here; the set comes from the backend's discovery of
+ * `providesUi`, e.g. the Context Library). The Workshop hosts each at `/gatekeepers/$appId` and links
+ * it on /gatekeepers (from the connector's card, or under Built in) — no gatekeeper is hardcoded here; the set comes from the backend's discovery of
  * bound gatekeepers. Returns [] until authenticated/loaded. `GatekeeperAppInfo` is plain data
  * (id/title/icon), so it's safe to hold in state.
  */

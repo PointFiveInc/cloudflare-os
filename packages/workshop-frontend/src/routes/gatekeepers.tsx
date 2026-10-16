@@ -1,10 +1,11 @@
 import { logRpcFailure } from '../rpcErrors'
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 import { useEffect, useMemo, useState } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import {
   MagnifyingGlass,
   ArrowsClockwise,
+  BookOpen,
   Plus,
   CaretRight,
   Hexagon,
@@ -13,7 +14,7 @@ import {
 } from '@phosphor-icons/react'
 import ViewToggle from '../components/ViewToggle'
 import { useAuthenticatedApi } from '../AuthContext'
-import { refreshGatekeeperApps } from '../useGatekeeperApps'
+import { refreshGatekeeperApps, useGatekeeperApps } from '../useGatekeeperApps'
 import { EmptyState } from '../components/EmptyState'
 import ConnectConnectorModal from '../components/ConnectConnectorModal'
 import {
@@ -21,7 +22,7 @@ import {
   SupportedResource,
   VendorDescription,
 } from '@gadgets/workshop-shared/gatekeeper'
-import { GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
+import type { GatekeeperAppInfo, GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { useSiteName } from '../ServerConfigContext'
 import { AccountsSubscriberAdapter } from '../accountsSubscriber'
@@ -87,6 +88,7 @@ interface ConnectorCardProps {
   onClick: () => void
   onReconnect?: () => void
   reconnectBusy?: boolean
+  app?: GatekeeperAppInfo
   view?: 'grid' | 'list'
 }
 
@@ -102,6 +104,7 @@ function ConnectorCard({
   onClick,
   onReconnect,
   reconnectBusy = false,
+  app,
   view = 'grid',
 }: ConnectorCardProps) {
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -137,7 +140,20 @@ function ConnectorCard({
     </span>
   ) : null
 
-  const trailing =
+  const appLink = app && state !== 'expired' ? (
+    <Link
+      to="/gatekeepers/$appId"
+      params={{ appId: app.id }}
+      aria-label={`View the ${app.title} page`}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+      className="inline-flex h-8 items-center rounded-full border border-kumo-line bg-kumo-base px-3 text-[12px] leading-4 font-medium tracking-[-0.2px] text-kumo-default transition-[background-color,border-color] duration-150 ease-out hover:border-kumo-fill hover:bg-kumo-tint"
+    >
+      View page
+    </Link>
+  ) : null
+
+  const action =
     state === 'expired' && onReconnect ? (
       <button
         type="button"
@@ -160,6 +176,13 @@ function ConnectorCard({
         )}
       </div>
     )
+
+  const trailing = (
+    <div className="flex items-center gap-1.5">
+      {appLink}
+      {action}
+    </div>
+  )
 
   if (view === 'list') {
     return (
@@ -234,6 +257,68 @@ function ConnectorCard({
 
       <div className="self-center">{trailing}</div>
     </div>
+  )
+}
+
+function AppIcon({ app, size }: { app: GatekeeperAppInfo; size: number }) {
+  if (!app.icon) return <BookOpen size={size} weight="regular" />
+  const maskUrl = `url("${app.icon.url.replace(/[\\"]/g, '\\$&')}")`
+  return (
+    <span
+      aria-hidden
+      className="bg-current"
+      style={{
+        width: size,
+        height: size,
+        maskImage: maskUrl,
+        WebkitMaskImage: maskUrl,
+        maskRepeat: 'no-repeat',
+        WebkitMaskRepeat: 'no-repeat',
+        maskPosition: 'center',
+        WebkitMaskPosition: 'center',
+        maskSize: 'contain',
+        WebkitMaskSize: 'contain',
+      }}
+    />
+  )
+}
+
+function BuiltInAppCard({ app, view }: { app: GatekeeperAppInfo; view: 'grid' | 'list' }) {
+  const caret = (
+    <CaretRight
+      size={14}
+      weight="bold"
+      className="shrink-0 text-kumo-inactive transition-colors group-hover:text-kumo-default"
+    />
+  )
+  return view === 'list' ? (
+    <Link
+      to="/gatekeepers/$appId"
+      params={{ appId: app.id }}
+      className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 transition-colors duration-150 ease-out hover:bg-kumo-tint"
+    >
+      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-kumo-tint text-kumo-default">
+        <AppIcon app={app} size={18} />
+      </span>
+      <span className="min-w-0 flex-1 truncate text-sm font-medium tracking-[-0.25px] text-kumo-default">
+        {app.title}
+      </span>
+      {caret}
+    </Link>
+  ) : (
+    <Link
+      to="/gatekeepers/$appId"
+      params={{ appId: app.id }}
+      className="themed-card-hover-shadow group grid w-full grid-cols-[48px_1fr_auto] items-center gap-4 rounded-2xl border border-kumo-line bg-kumo-base px-5 py-5 transition-[border-color,transform,box-shadow] duration-150 ease-out hover:-translate-y-px hover:border-kumo-fill active:scale-[0.995]"
+    >
+      <span className="grid h-12 w-12 place-items-center rounded-2xl bg-kumo-tint text-kumo-default">
+        <AppIcon app={app} size={24} />
+      </span>
+      <span className="min-w-0 truncate text-[15px] leading-5 font-medium tracking-[-0.25px] text-kumo-default">
+        {app.title}
+      </span>
+      {caret}
+    </Link>
   )
 }
 
@@ -448,6 +533,7 @@ function ConnectorsPage() {
 
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
+  const gatekeeperApps = useGatekeeperApps()
 
   const [search, setSearch] = useState('')
   const [view, setView] = useState<'grid' | 'list'>(() => {
@@ -574,7 +660,7 @@ function ConnectorsPage() {
         // "Connected" via the subscription and drops out of "Available".
         await authenticatedApi.provisionAmbientAccount(vendorId)
         setAddable((prev) => prev.filter((g) => g.id !== vendorId))
-        // If the gatekeeper provides a management UI, its nav entry should appear without a reload.
+        // If the gatekeeper provides a management UI, its page link should appear without a reload.
         refreshGatekeeperApps(authenticatedApi)
       } else {
         openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
@@ -617,7 +703,7 @@ function ConnectorsPage() {
       // If this was an opt-in ambient account, it's now removable and should return to "Available";
       // re-fetch the addable list so it reappears there immediately (no refresh needed).
       authenticatedApi.listAddableGatekeepers().then(setAddable).catch(() => {})
-      // Drop its nav entry too, if it provided a management UI.
+      // Drop its page link too, if it provided a management UI.
       refreshGatekeeperApps(authenticatedApi)
       handleCloseModal()
     } catch (err) {
@@ -659,6 +745,17 @@ function ConnectorsPage() {
       )
     })
   }, [accounts, vendors, searchLower])
+
+  // Apps of gatekeepers that are on for everyone have no Connected card, so they are listed apart.
+  const filteredBuiltInApps = useMemo(() => {
+    if (!accountsLoaded) return []
+    const connectedVendorIds = new Set(accounts.map((a) => a.vendorId))
+    return gatekeeperApps.filter(
+      (app) =>
+        !connectedVendorIds.has(app.id) &&
+        (!searchLower || app.title.toLowerCase().includes(searchLower)),
+    )
+  }, [accountsLoaded, accounts, gatekeeperApps, searchLower])
 
   // Connectable vendors = OAuth/resource gatekeepers plus opt-in ambient ones, rendered identically.
   // An ambient vendor is recognized by `description.autoProvisionsAccount`, which routes the connect
@@ -794,10 +891,22 @@ function ConnectorsPage() {
                     onClick={() => handleOpenManage(account.id)}
                     onReconnect={() => handleReconnect(account.id)}
                     reconnectBusy={reconnectingAccountId === account.id}
+                    app={gatekeeperApps.find((a) => a.id === account.vendorId)}
                     view={view}
                   />
                 )
               })}
+            </div>
+          </section>
+        )}
+
+        {filteredBuiltInApps.length > 0 && (
+          <section className="mb-10">
+            <SectionEyebrow label="Built in" count={filteredBuiltInApps.length} />
+            <div className={sectionGridClass}>
+              {filteredBuiltInApps.map((app) => (
+                <BuiltInAppCard key={app.id} app={app} view={view} />
+              ))}
             </div>
           </section>
         )}
@@ -827,6 +936,7 @@ function ConnectorsPage() {
         {!initialLoading &&
           !loadError &&
           filteredAccounts.length === 0 &&
+          filteredBuiltInApps.length === 0 &&
           filteredAvailable.length === 0 && (
             <EmptyState
               title={
