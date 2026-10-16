@@ -2,8 +2,18 @@ import { useCallback, useRef, type Dispatch, type SetStateAction } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type { ActionState, Overseer } from '@gadgets/workshop-shared/api'
+import { rpcFailureDescription } from './rpcErrors'
 
 type ActionDecision = 'approve' | 'deny'
+
+const MAX_REASON_LENGTH = 300
+
+// Why the gatekeeper refused, e.g. a provider's validation error, so the person can fix it.
+function failureReason(error: unknown): string | undefined {
+  const reason = rpcFailureDescription(error)
+  if (reason === undefined || reason.length <= MAX_REASON_LENGTH) return reason
+  return `${reason.slice(0, MAX_REASON_LENGTH - 1)}…`
+}
 
 export function useResolveAction(
   overseer: RpcStub<Overseer>,
@@ -22,7 +32,11 @@ export function useResolveAction(
       onResolvedRef.current?.(actionId, decision === 'approve' ? 'approved' : 'rejected')
     } catch (error) {
       console.error(`Failed to ${decision} action:`, error)
-      toasts.add({ title: `Failed to ${decision} action`, variant: 'error' })
+      toasts.add({
+        title: `Failed to ${decision} action`,
+        description: failureReason(error),
+        variant: 'error',
+      })
     } finally {
       setProcessing(previous => {
         const next = new Set(previous)
