@@ -946,7 +946,7 @@ describe("Gmail session API surface", () => {
 });
 
 describe("Gmail auto-approval eligibility", () => {
-  it("advertises and annotates distinct non-send actions", async () => {
+  it("advertises and annotates distinct actions", async () => {
     const {gatekeeper} = actionHarness((url, init) => {
       if (url.pathname === "/gmail/v1/users/me/messages/abc123" && !init.method) {
         return json(messageMetadata("abc123", "def456"));
@@ -968,9 +968,11 @@ describe("Gmail auto-approval eligibility", () => {
       {tag: "unstar", label: "Unstar messages"},
       {tag: "applyLabel", label: "Apply labels to messages"},
       {tag: "removeLabel", label: "Remove labels from messages"},
+      {tag: "send", label: "Send emails"},
       {tag: "draftCreate", label: "Create drafts"},
       {tag: "draftUpdate", label: "Update drafts"},
       {tag: "draftDelete", label: "Delete drafts"},
+      {tag: "draftSend", label: "Send drafts"},
       {tag: "labelCreate", label: "Create labels"},
       {tag: "labelRename", label: "Rename labels"},
       {tag: "labelDelete", label: "Delete labels"},
@@ -1095,7 +1097,7 @@ describe("Gmail auto-approval eligibility", () => {
       ]);
   });
 
-  it("keeps every email delivery path ineligible", async () => {
+  it("makes every email delivery path eligible", async () => {
     const sourceRaw = buildEncodedEmail({
       from: "sender@example.com",
       to: ["me@example.com"],
@@ -1154,19 +1156,16 @@ describe("Gmail auto-approval eligibility", () => {
 
     const descriptions = (await queue.read!()).submissions.map(submission =>
       submission.description as {actionKind?: ActionKind; autoApprovable?: boolean});
-    expect(descriptions).toHaveLength(6);
-    for (const index of [0, 1, 2, 3, 5]) {
-      expect(descriptions[index]).not.toHaveProperty("actionKind");
-      expect(descriptions[index]).not.toHaveProperty("autoApprovable");
-    }
+    const send = {actionKind: {tag: "send", label: "Send emails"}, autoApprovable: true};
+    expect(descriptions).toMatchObject([
+      send, send, send, send,
+      {actionKind: {tag: "draftCreate", label: "Create drafts"}, autoApprovable: true},
+      {actionKind: {tag: "draftSend", label: "Send drafts"}, autoApprovable: true},
+    ]);
     // Later reads show each message as sent, so no send stops the caller to wait for a decision.
     for (const description of descriptions) {
       expect(description).not.toHaveProperty("awaitDecision");
     }
-    expect(descriptions[4]).toMatchObject({
-      actionKind: {tag: "draftCreate", label: "Create drafts"},
-      autoApprovable: true,
-    });
   });
 });
 

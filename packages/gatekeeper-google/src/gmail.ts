@@ -210,12 +210,14 @@ const MESSAGE_MUTATION_LABELS = {
   removeLabel: "Remove labels from messages",
 } satisfies Record<GmailMutationOperation, string>;
 
-type GmailResourceActionType = Exclude<GmailAction["type"], "messageMutation" | "send" | "draftSend">;
+type GmailResourceActionType = Exclude<GmailAction["type"], "messageMutation">;
 
 const RESOURCE_ACTION_LABELS = {
+  send: "Send emails",
   draftCreate: "Create drafts",
   draftUpdate: "Update drafts",
   draftDelete: "Delete drafts",
+  draftSend: "Send drafts",
   labelCreate: "Create labels",
   labelRename: "Rename labels",
   labelDelete: "Delete labels",
@@ -229,17 +231,16 @@ function gmailAutoApprovalMetadata(
     action: GmailAction,
 ): Partial<Pick<ActionDescription, "actionKind" | "autoApprovable">> {
   switch (action.type) {
-  case "send":
-  case "draftSend":
-    return {};
   case "messageMutation":
     return {
       actionKind: {tag: action.operation, label: MESSAGE_MUTATION_LABELS[action.operation]},
       autoApprovable: true,
     };
+  case "send":
   case "draftCreate":
   case "draftUpdate":
   case "draftDelete":
+  case "draftSend":
   case "labelCreate":
   case "labelRename":
   case "labelDelete":
