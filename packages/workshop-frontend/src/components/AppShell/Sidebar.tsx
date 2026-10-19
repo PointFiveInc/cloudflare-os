@@ -1,6 +1,7 @@
 import { Link } from '@tanstack/react-router'
 import {
   Blueprint,
+  BookOpen,
   Compass,
   Hexagon,
   House,
@@ -10,8 +11,10 @@ import {
   SquaresFour,
   Stack,
 } from '@phosphor-icons/react'
+import type { GatekeeperAppInfo } from '@gadgets/workshop-shared/api'
 import { useSiteName } from '../../ServerConfigContext'
 import SiteLogo from '../SiteLogo'
+import { useGatekeeperApps } from '../../useGatekeeperApps'
 import { openCommandPalette } from './commandPaletteBus'
 import SidebarItem from './SidebarItem'
 import {
@@ -20,6 +23,29 @@ import {
   SidebarWorkspacesLists,
 } from './SidebarWorkspaces'
 import SidebarUtilityStrip from './SidebarUtilityStrip'
+
+const CONTEXT_APP_ID = 'context'
+
+function GatekeeperAppIcon({ app }: { app: GatekeeperAppInfo }) {
+  if (!app.icon) return <BookOpen size={14} weight="regular" />
+  const maskUrl = `url("${app.icon.url.replace(/[\\"]/g, '\\$&')}")`
+  return (
+    <span
+      aria-hidden
+      className="h-3.5 w-3.5 bg-current"
+      style={{
+        maskImage: maskUrl,
+        WebkitMaskImage: maskUrl,
+        maskRepeat: 'no-repeat',
+        WebkitMaskRepeat: 'no-repeat',
+        maskPosition: 'center',
+        WebkitMaskPosition: 'center',
+        maskSize: 'contain',
+        WebkitMaskSize: 'contain',
+      }}
+    />
+  )
+}
 
 /**
  * The persistent left rail. Three pinned regions sandwich a single scrolling region of lists, so
@@ -41,6 +67,7 @@ export default function Sidebar({
   onToggleCollapsed: () => void
 }) {
   const siteName = useSiteName()
+  const contextApp = useGatekeeperApps().find((app) => app.id === CONTEXT_APP_ID)
 
   return (
     <aside
@@ -136,6 +163,15 @@ export default function Sidebar({
               icon={<Stack size={14} weight="regular" />}
               collapsed={collapsed}
             />
+            {contextApp && (
+              <SidebarItem
+                to="/gatekeepers/$appId"
+                params={{ appId: contextApp.id }}
+                label={contextApp.title}
+                icon={<GatekeeperAppIcon app={contextApp} />}
+                collapsed={collapsed}
+              />
+            )}
             <SidebarItem
               to="/gatekeepers"
               label="Gatekeepers"
