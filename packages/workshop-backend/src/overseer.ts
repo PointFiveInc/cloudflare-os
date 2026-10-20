@@ -48,6 +48,7 @@ import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alw
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { GadgetExportsImpl } from "./exports-session";
+import { p5AgentExportsHost } from "./p5-export-viewer";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
@@ -4850,8 +4851,8 @@ class OverseerImpl implements AgentHooks {
     return resolved.formats;
   }
 
-  async exportGadget(gadgetId: WorkpieceId, formatId: string, viewer: GadgetViewer,
-      chatId?: number): Promise<ReadableStream<Uint8Array>> {
+  async exportGadget(gadgetId: WorkpieceId, formatId: string, chatId: number | undefined,
+      viewer: GadgetViewer): Promise<ReadableStream<Uint8Array>> {
     this.checkChatExistsAndMaterializeChanges(chatId);
     let {formats, handler, gadget} = await this.#resolveGadgetExportFormats(gadgetId, chatId);
     if (!gadget) throw new Error("The Gadget server stub is unavailable.");
@@ -5297,7 +5298,7 @@ class OverseerImpl implements AgentHooks {
           throw new Error("Gadget exports are only available to the agent's executeCode.");
         }
         this.#getOrCreateCapturedActions(caller.chatId).accessedGadget = true;
-        return Promise.resolve(new GadgetExportsImpl(this, target.id, caller.chatId));
+        return Promise.resolve(new GadgetExportsImpl(p5AgentExportsHost(this), target.id, caller.chatId));
 
       case "git":
         return Promise.resolve(new GitImpl(this, () => this.#gitAuthorFor(caller)));
@@ -13051,7 +13052,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async export(formatId: string, chatId?: number): Promise<ReadableStream<Uint8Array>> {
-    return this.impl.exportGadget(this.id, formatId, await this.#viewer(), chatId);
+    return this.impl.exportGadget(this.id, formatId, chatId, await this.#viewer());
   }
 
   async listBindings(chatId?: number): Promise<GadgetBindingInfo[]> {
@@ -13337,7 +13338,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   async export(id: string, chatId?: number): Promise<ReadableStream<Uint8Array>> {
     if (chatId !== undefined) this.#deny();
-    return this.impl.exportGadget(this.id, id, await this.#viewer());
+    return this.impl.exportGadget(this.id, id, undefined, await this.#viewer());
   }
 
   // --- Denied methods (build-only) ---
