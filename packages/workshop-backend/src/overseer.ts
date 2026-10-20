@@ -4765,7 +4765,10 @@ class OverseerImpl implements AgentHooks {
 
   // Bundled client code, keyed by the same thing loadGadgetWorker keys its loads by (see
   // #uiBundleCacheKey). Bounded because a bundle that pulls in a vetted library is megabytes and
-  // the key moves on every merge: without a cap this grows for the lifetime of the DO.
+  // the key moves on every merge: without a cap this grows for the lifetime of the DO. A client.js
+  // the bundler hands back verbatim is never stored: the files are already read before the
+  // lookup, so its entry would hold a second copy of the file, and push a real bundle out of the
+  // cap, to save at most the cheap single-file build a false import match costs (see mightImport).
   #uiBundleCache = new Map<string, string>();
 
   /**
@@ -4809,15 +4812,15 @@ class OverseerImpl implements AgentHooks {
       // A Gadget that imports nothing gets its client.js back verbatim; see bundleGadgetClient.
       let startedAt = Date.now();
       let jsCode = await bundleGadgetClient(this.env.LOADER, `${this.ctx.id}`, files);
+      let passthrough = jsCode === files.get("client.js");
       // Distinct event names rather than a "bundled" field: the field vocabulary in
       // observability.ts is deliberately closed, and the distinction is worth a name anyway --
-      // a passthrough means the bundler was never involved.
+      // a passthrough means the bundler changed nothing.
       this.logger.info("built a Gadget UI bundle", {
-        event: jsCode === files.get("client.js")
-            ? "gadget.ui.bundle.passthrough"
-            : "gadget.ui.bundle.built",
+        event: passthrough ? "gadget.ui.bundle.passthrough" : "gadget.ui.bundle.built",
         chatId, size: jsCode.length, durationMs: Date.now() - startedAt,
       });
+      if (passthrough) return {jsCode};
       // Insertion-ordered, so the oldest key is the first one -- a plain FIFO is enough here:
       // entries are invalidated by the key moving, not by age, and the cap only exists to bound
       // memory.
