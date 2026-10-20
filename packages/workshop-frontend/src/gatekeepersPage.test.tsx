@@ -30,7 +30,9 @@ vi.mock('./ServerConfigContext', () => ({ useSiteName: () => 'Workshop' }))
 vi.mock('./components/ConnectConnectorModal', () => ({ default: () => null }))
 vi.mock('./useGatekeeperApps', () => ({
   refreshGatekeeperApps: () => {},
-  useGatekeeperApps: () => [
+}))
+vi.mock('./p5-gatekeeperApps', () => ({
+  useGatekeeperAppsOf: () => [
     { id: 'salesforce', title: 'Salesforce' },
     { id: 'jira', title: 'Jira' },
     { id: 'newsletters', title: 'Newsletters' },

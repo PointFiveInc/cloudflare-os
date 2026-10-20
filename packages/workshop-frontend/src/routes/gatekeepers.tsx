@@ -14,7 +14,8 @@ import {
 } from '@phosphor-icons/react'
 import ViewToggle from '../components/ViewToggle'
 import { useAuthenticatedApi } from '../AuthContext'
-import { refreshGatekeeperApps, useGatekeeperApps } from '../useGatekeeperApps'
+import { refreshGatekeeperApps } from '../useGatekeeperApps'
+import { useGatekeeperAppsOf } from '../p5-gatekeeperApps'
 import { EmptyState } from '../components/EmptyState'
 import ConnectConnectorModal from '../components/ConnectConnectorModal'
 import {
@@ -535,7 +536,7 @@ function ConnectorsPage() {
 
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
-  const gatekeeperApps = useGatekeeperApps()
+  const gatekeeperApps = useGatekeeperAppsOf(authenticatedApi)
 
   const [search, setSearch] = useState('')
   const [view, setView] = useState<'grid' | 'list'>(() => {
