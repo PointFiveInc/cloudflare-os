@@ -32,12 +32,14 @@ vi.mock('./useGatekeeperApps', () => ({
   refreshGatekeeperApps: () => {},
 }))
 vi.mock('./p5-gatekeeperApps', () => ({
-  useGatekeeperAppsOf: () => [
-    { id: 'salesforce', title: 'Salesforce' },
-    { id: 'jira', title: 'Jira' },
-    { id: 'newsletters', title: 'Newsletters' },
-  ],
+  useGatekeeperAppsOf: (api: unknown) => (api === authenticatedApi ? gatekeeperApps : []),
 }))
+
+const gatekeeperApps = [
+  { id: 'salesforce', title: 'Salesforce' },
+  { id: 'jira', title: 'Jira' },
+  { id: 'newsletters', title: 'Newsletters' },
+]
 
 const account = (id: number, vendorId: string, displayName: string, credentialsValid = true) => (
   subscriber: ConnectedAccountsSubscriber,
