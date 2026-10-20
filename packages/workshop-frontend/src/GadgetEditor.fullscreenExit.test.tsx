@@ -46,7 +46,10 @@ const mocks = vi.hoisted(() => {
       cancelObserverConfig: () => {},
       updateTitle: () => {},
     },
-    authenticatedApi: { whoami: async () => ({ type: 'user', id: 'dev', name: 'Dev' }) },
+    authenticatedApi: {
+      whoami: async () => ({ type: 'user', id: 'dev', name: 'Dev' }),
+      listGadgets: async () => [],
+    },
   }
 })
 
@@ -131,6 +134,7 @@ vi.mock('./components/ReconnectingChip', () => ({ default: () => null }))
 vi.mock('./components/SiteLogo', () => ({ default: () => null }))
 vi.mock('./components/UserMenu', () => ({ default: () => null }))
 vi.mock('./components/WorkspaceOpenErrorPage', () => ({ default: () => null }))
+vi.mock('./features/notifications/WorkspaceNotificationsMenu', () => ({ WorkspaceNotificationsMenu: () => null }))
 
 import GadgetEditor from './GadgetEditor'
 
