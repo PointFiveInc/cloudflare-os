@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
+import { AgentTurnError } from "../src/ai-invoke.js";
 import { getModel } from "../src/ai-models.js";
+import {
+  requestAnthropicCompaction, supportsAnthropicCompaction,
+} from "../src/anthropic-compaction.js";
 
 // A provider key stored on the gateway under an alias other than "default" is reachable only when
 // every request names it in `cf-aig-byok-alias`; a request without the header silently falls back
@@ -43,15 +47,18 @@ describe.each(TRANSPORTS)("cf-aig-byok-alias over the $transport transport", (tr
     sentRequests.length = 0;
   });
 
-  async function sentHeaders(config: AiModelConfig, alias: string | undefined): Promise<Headers> {
-    const env = {
+  function gatewayEnv(alias: string | undefined): Cloudflare.Env {
+    return {
       CF_AI_GATEWAY: "platform-gateway",
       CF_AI_GATEWAY_ACCOUNT_ID: "gateway-account-id",
       CF_AI_GATEWAY_PROVIDERS: "anthropic,cloudflare",
       CF_AI_GATEWAY_BYOK_ALIAS: alias,
       ...transport.env,
     } as Cloudflare.Env;
-    const handle = getModel(env, config, INITIATOR);
+  }
+
+  async function sentHeaders(config: AiModelConfig, alias: string | undefined): Promise<Headers> {
+    const handle = getModel(gatewayEnv(alias), config, INITIATOR);
     const message = await handle.stream(handle.model, {
       messages: [{ role: "user", content: "hello", timestamp: 0 }],
     }, { ...transport.streamOptions, maxRetries: 0 }).result();
@@ -73,4 +80,18 @@ describe.each(TRANSPORTS)("cf-aig-byok-alias over the $transport transport", (tr
           expect(headers.has("cf-aig-byok-alias")).toBe(false);
         }
       }, 15000);
+
+  // Compaction sends its own options through the turn's stream; the alias must survive them.
+  it("names the configured alias on an Anthropic compaction request", async () => {
+    const handle = getModel(gatewayEnv("pointfive-os"),
+        { provider: "anthropic", model: "claude-sonnet-4-6", apiToken: "ignored-in-gateway-mode" },
+        INITIATOR);
+    expect(supportsAnthropicCompaction(handle.model)).toBe(true);
+    await expect(requestAnthropicCompaction(handle, handle.stream,
+        { messages: [{ role: "user", content: "hello", timestamp: 0 }] }, "Summarize the chat.",
+        { ...transport.streamOptions, maxRetries: 0 })).rejects.toBeInstanceOf(AgentTurnError);
+    expect(sentRequests).toHaveLength(1);
+    expect(await sentRequests[0].clone().json()).toHaveProperty("compaction.type", "summarize");
+    expect(sentRequests[0].headers.get("cf-aig-byok-alias")).toBe("pointfive-os");
+  }, 15000);
 });

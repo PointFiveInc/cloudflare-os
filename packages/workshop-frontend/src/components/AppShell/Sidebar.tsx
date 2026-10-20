@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import {
+  ArrowLeft,
   Blueprint,
   BookOpen,
   Compass,
@@ -23,6 +24,7 @@ import {
   SidebarWorkspacesLists,
 } from './SidebarWorkspaces'
 import SidebarUtilityStrip from './SidebarUtilityStrip'
+import { inNativeApp, returnToInstalls } from '../../features/native-app/nativeApp'
 
 const CONTEXT_APP_ID = 'context'
 
@@ -199,6 +201,20 @@ export default function Sidebar({
       </SidebarWorkspacesProvider>
 
       <SidebarUtilityStrip collapsed={collapsed} />
+      {inNativeApp() && (
+        <button
+          type="button"
+          onClick={returnToInstalls}
+          aria-label="Back to installs"
+          className={[
+            'flex min-h-11 shrink-0 items-center border-t border-kumo-line py-2 text-sm text-kumo-default hover:bg-kumo-tint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring',
+            collapsed ? 'justify-center px-2' : 'gap-2 px-4',
+          ].join(' ')}
+        >
+          <ArrowLeft size={16} aria-hidden="true" />
+          {!collapsed && 'Back to installs'}
+        </button>
+      )}
     </aside>
   )
 }

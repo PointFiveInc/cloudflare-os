@@ -30,12 +30,16 @@ vi.mock('./ServerConfigContext', () => ({ useSiteName: () => 'Workshop' }))
 vi.mock('./components/ConnectConnectorModal', () => ({ default: () => null }))
 vi.mock('./useGatekeeperApps', () => ({
   refreshGatekeeperApps: () => {},
-  useGatekeeperApps: () => [
-    { id: 'salesforce', title: 'Salesforce' },
-    { id: 'jira', title: 'Jira' },
-    { id: 'newsletters', title: 'Newsletters' },
-  ],
 }))
+vi.mock('./p5-gatekeeperApps', () => ({
+  useGatekeeperAppsOf: (api: unknown) => (api === authenticatedApi ? gatekeeperApps : []),
+}))
+
+const gatekeeperApps = [
+  { id: 'salesforce', title: 'Salesforce' },
+  { id: 'jira', title: 'Jira' },
+  { id: 'newsletters', title: 'Newsletters' },
+]
 
 const account = (id: number, vendorId: string, displayName: string, credentialsValid = true) => (
   subscriber: ConnectedAccountsSubscriber,

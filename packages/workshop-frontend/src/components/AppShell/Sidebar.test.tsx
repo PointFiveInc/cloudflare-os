@@ -32,7 +32,7 @@ const otherApps: GatekeeperAppInfo[] = [
 ]
 const contextApp: GatekeeperAppInfo = {
   id: 'context',
-  title: 'Context & Skills',
+  title: 'Skills',
   icon: { url: 'https://example.com/library.svg' },
 }
 
@@ -63,10 +63,10 @@ describe('Sidebar', () => {
     return container
   }
 
-  it('lists Context & Skills as its only connector page, beside the Gatekeepers page', () => {
+  it('lists Skills as its only connector page, beside the Gatekeepers page', () => {
     const sidebar = renderSidebar([...otherApps, contextApp])
 
-    expect(connectorPageLinks(sidebar)).toEqual([['/gatekeepers/context', 'Context & Skills']])
+    expect(connectorPageLinks(sidebar)).toEqual([['/gatekeepers/context', 'Skills']])
     expect(sidebar.textContent).not.toContain('The Brain')
     expect(sidebar.textContent).not.toContain('Salesforce')
     expect(sidebar.textContent).not.toContain('Google')
@@ -77,7 +77,7 @@ describe('Sidebar', () => {
     const sidebar = renderSidebar(otherApps)
 
     expect(connectorPageLinks(sidebar)).toEqual([])
-    expect(sidebar.textContent).not.toContain('Context & Skills')
+    expect(sidebar.textContent).not.toContain('Skills')
     expect(sidebar.querySelector('a[href="/gatekeepers"]')?.textContent).toBe('Gatekeepers')
   })
 })

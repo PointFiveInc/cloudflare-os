@@ -24,6 +24,7 @@ vi.mock('./useAuth', () => ({
       isOnboardingCompleted: () => Promise.resolve(true),
       whoami: () => Promise.resolve(null),
       amIAdmin: () => Promise.resolve(false),
+      subscribeToNotifications: () => Object.assign(Promise.resolve(), { [Symbol.dispose]() {} }),
     },
     isLoading: false,
     error: null,

@@ -6,7 +6,7 @@
 // inline and has no `worker_loaders`, so `env.LOADER` only exists here, where the pool reads the
 // real wrangler.jsonc.
 import { env, runInDurableObject } from "cloudflare:test";
-import { exports } from "cloudflare:workers";
+import { exports, type WorkerEntrypoint } from "cloudflare:workers";
 import { GadgetBundleError, bundleGadgetClient } from "../src/gadget-bundle";
 import { describe, expect, it } from "vitest";
 
@@ -23,6 +23,66 @@ async function bundleError(files: Record<string, string>): Promise<string> {
     return (error as GadgetBundleError).message;
   }
   throw new Error("expected bundling to fail");
+}
+
+/** A one-page PDF showing `text` in Helvetica, with a correct xref table. */
+function onePagePdf(text: string): Uint8Array {
+  let content = `BT /F1 24 Tf 20 100 Td (${text}) Tj ET`;
+  let objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R" +
+        " /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let pdf = "%PDF-1.4\n";
+  let offsets = objects.map((object, i) => {
+    let offset = pdf.length;
+    pdf += `${i + 1} 0 obj\n${object}\nendobj\n`;
+    return offset;
+  });
+  let xref = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` +
+      offsets.map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("") +
+      `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return new TextEncoder().encode(pdf);
+}
+
+interface PdfOpener extends WorkerEntrypoint {
+  open(data: Uint8Array, verbosity?: "WARNINGS"):
+      Promise<{ numPages: number; text: string; logged: string[] }>;
+}
+
+/**
+ * Loads a bundled client.js into an isolate of its own and returns an entry point that opens a
+ * PDF with the `getDocument` it exports. `capture.js` is evaluated first, so `logged` also holds
+ * anything the bundle prints while it loads.
+ */
+function pdfOpener(key: string, clientBundle: string) {
+  return env.LOADER.get(`gadget-bundle-test.${key}`, () => ({
+    compatibilityDate: "2026-02-01",
+    mainModule: "opener.js",
+    modules: {
+      "capture.js": `export const logged = [];
+for (const level of ["debug", "info", "log", "warn", "error"]) {
+  console[level] = (...args) => logged.push(args.join(" "));
+}`,
+      "opener.js": `import {logged} from "./capture.js";
+import {WorkerEntrypoint} from "cloudflare:workers";
+import {getDocument, VerbosityLevel} from "./client.js";
+export default class extends WorkerEntrypoint {
+  async open(data, verbosity) {
+    const params = verbosity ? {data, verbosity: VerbosityLevel[verbosity]} : {data};
+    const pdf = await getDocument(params).promise;
+    const {items} = await (await pdf.getPage(1)).getTextContent();
+    return {numPages: pdf.numPages, text: items.map((item) => item.str).join(""), logged};
+  }
+}`,
+      "client.js": clientBundle,
+    },
+    globalOutbound: null,
+  })).getEntrypoint<PdfOpener>();
 }
 
 describe("bundleGadgetClient", () => {
@@ -160,6 +220,25 @@ describe("bundleGadgetClient", () => {
     // ESM subtlety the wrapper relies on -- an explicit local export takes precedence over the
     // `export *` beside it -- so a reordering that broke it would otherwise go unnoticed.
     expect(code).toMatch(/verbosity:\s*\w+\.ERRORS/);
+  });
+
+  it("opens a PDF through the bundled @gadget/pdf and logs nothing by default", async () => {
+    // The text checks above cannot see a pdf.js upgrade that breaks at runtime (the fake-worker
+    // hook, a getDocument option, a missing built-in). This runs the bytes a Gadget gets, though
+    // in a Worker isolate rather than the browser.
+    let code = await bundle({
+      "client.js": `export {getDocument, VerbosityLevel} from "@gadget/pdf";`,
+    });
+    let pdf = onePagePdf("Hello PDF");
+
+    expect(await pdfOpener("pdf-quiet", code).open(pdf))
+        .toEqual({ numPages: 1, text: "Hello PDF", logged: [] });
+
+    // Proves the capture hears pdf.js: asked for warnings, a fresh isolate's first load reports
+    // that it set up the main-thread fake worker.
+    let verbose = await pdfOpener("pdf-verbose", code).open(pdf, "WARNINGS");
+    expect(verbose.text).toBe("Hello PDF");
+    expect(verbose.logged).not.toEqual([]);
   });
 
   it("does not put a library into a Gadget that does not import it", async () => {
