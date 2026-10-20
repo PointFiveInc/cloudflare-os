@@ -8,6 +8,7 @@ import { GadgetMetadataWithTimestamps, BlueprintPublicInfo, Overseer, AiChatAuth
 import { WorkspaceNotificationsMenu } from '../features/notifications/WorkspaceNotificationsMenu'
 import { describeMute } from '../features/notifications/notificationMute'
 import ShareModal from '../ShareModal'
+import { p5OffersShare } from '../p5-owner-only'
 import { BindingBadge, getGradient as getBlueprintGradient, uniqueBindingBadges } from './BlueprintCard'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './menuStyles'
 import { BlueprintPreviewImage } from './BlueprintPreviewImage'
@@ -157,10 +158,12 @@ function AppRow({
             <Info size={13} className="mr-2" />
             Information
           </DropdownMenu.Item>
+          {p5OffersShare(gadget) && (
           <DropdownMenu.Item onClick={() => onShare(gadget)} className={MENU_ITEM}>
             <ShareNetwork size={13} className="mr-2" />
             Share
           </DropdownMenu.Item>
+          )}
           <WorkspaceNotificationsMenu
             workspaceId={gadget.id}
             mute={gadget.notificationMute}

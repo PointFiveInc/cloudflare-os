@@ -56,6 +56,7 @@ import ChatInterface, {
 import { formatOf } from './components/format/formats'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import ShareModal from './ShareModal'
+import { p5OffersShare } from './p5-owner-only'
 import { GadgetPresence } from './components/GadgetPresence'
 import BlueprintModal from './BlueprintModal'
 import { UpdateFromBlueprintDialog } from './features/blueprint-updates/UpdateFromBlueprintDialog'
@@ -1650,6 +1651,7 @@ export default function GadgetEditor() {
 
           {showReconnecting && <ReconnectingChip />}
 
+          {p5OffersShare(metadata) && (
           <WorkshopIconButton
             onClick={() => setShareModalOpen(true)}
             title="Share workspace"
@@ -1657,6 +1659,7 @@ export default function GadgetEditor() {
           >
             <ShareNetwork size={15} />
           </WorkshopIconButton>
+          )}
 
           <DropdownMenu>
             <DropdownMenu.Trigger
@@ -1812,9 +1815,11 @@ export default function GadgetEditor() {
             <DropdownMenu.Item onClick={() => setIsEditingTitle(true)} className={MENU_ITEM}>
               Rename workspace
             </DropdownMenu.Item>
+            {p5OffersShare(metadata) && (
             <DropdownMenu.Item onClick={() => setShareModalOpen(true)} className={MENU_ITEM}>
               Share workspace
             </DropdownMenu.Item>
+            )}
             {workspaceMute && workspaceMute.workspaceId === id && (
               <WorkspaceNotificationsMenu
                 workspaceId={workspaceMute.workspaceId}

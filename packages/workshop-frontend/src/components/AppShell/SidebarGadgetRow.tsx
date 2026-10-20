@@ -7,6 +7,7 @@ import type { GadgetMetadataWithTimestamps, NotificationMute } from '@gadgets/wo
 import { WorkspaceNotificationsMenu } from '../../features/notifications/WorkspaceNotificationsMenu'
 import { describeMute } from '../../features/notifications/notificationMute'
 import { isImeComposing } from '../../keyboardEvent'
+import { p5OffersShare } from '../../p5-owner-only'
 
 function initials(title: string | undefined): string {
   const t = (title || 'Untitled').trim()
@@ -128,12 +129,14 @@ export default function SidebarGadgetRow({
                   <Star size={13} className="mr-2" weight={gadget.pinned ? 'fill' : 'regular'} />
                   {gadget.pinned ? 'Unfavorite' : 'Favorite'}
                 </DropdownMenu.Item>
+                {p5OffersShare(gadget) && (
                 <DropdownMenu.Item
                   onClick={() => onShare(gadget)}
                   className={MENU_ITEM}
                 >
                   <ShareNetwork size={13} className="mr-2" /> Share
                 </DropdownMenu.Item>
+                )}
                 <WorkspaceNotificationsMenu
                   workspaceId={gadget.id}
                   mute={gadget.notificationMute}

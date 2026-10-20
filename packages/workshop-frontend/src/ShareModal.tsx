@@ -21,6 +21,7 @@ import { copyToClipboard } from './clipboard'
 import { isImeComposing } from './keyboardEvent'
 import { useServerConfig } from './ServerConfigContext'
 import { useUserDirectorySearch } from './features/user-directory/useUserDirectorySearch'
+import { P5_OWNER_ONLY_NOTICE, P5_WORKSPACE_ROLE_TEXT } from './p5-owner-only'
 
 type CollaboratorRow =
   | { kind: 'owner'; profile: AiChatAuthorInfo }
@@ -75,7 +76,7 @@ const ROLE_LABELS: Record<CollaboratorRole, string> = {
 }
 
 const ROLE_DESCRIPTIONS: Record<CollaboratorRole, string> = {
-  build: 'Edit gadgets, use chat, and manage access.',
+  build: P5_WORKSPACE_ROLE_TEXT,
   use: 'Use gadgets without agent chat or editing.',
 }
 
@@ -1021,10 +1022,7 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
               </div>
               {ownerInvitesOnly ? (
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
-                  This workspace has read data from a connection that doesn’t allow share links, so
-                  only the owner can add people. People the owner invites are asked to verify their
-                  own access to the connections it uses at their access level — some may be unable to
-                  open it. Anything the workspace has already saved is visible to everyone who can.
+                  {P5_OWNER_ONLY_NOTICE}
                 </p>
               ) : (
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
