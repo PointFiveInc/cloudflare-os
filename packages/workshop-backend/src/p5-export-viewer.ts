@@ -20,8 +20,8 @@ export interface P5AgentExportsOverseer {
 
 /**
  * The agent's `exports` host: each export renders for the person whose message started the chat's
- * running turn, read when the export is made. A turn a gadget started, or no turn, renders for the
- * workspace owner.
+ * current turn, running or paused, read when the export is made. A turn a gadget started, or no turn,
+ * renders for the workspace owner.
  */
 export function p5AgentExportsHost(overseer: P5AgentExportsOverseer): ExportsHost {
   return {
