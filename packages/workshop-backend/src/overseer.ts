@@ -77,6 +77,7 @@ import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker"
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
+import { p5OwnerOnly } from "./p5-owner-only";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -10166,6 +10167,7 @@ class OverseerImpl implements AgentHooks {
       this.#sharingManager = new SharingManager(
           this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get());
     }
+    p5OwnerOnly(this, this.#sharingManager);
     return this.#sharingManager;
   }
 
@@ -10416,6 +10418,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       this.impl.markOutputsDirty();
     }
 
+    await this.impl.getSharingManager();
     // The caller's effective role. The owner always has "build".
     let role: CollaboratorRole = "build";
 
