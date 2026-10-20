@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
-import type { Overseer } from '@gadgets/workshop-shared/api'
+import type { ActionLogEntry, Overseer } from '@gadgets/workshop-shared/api'
 
 const toasts = vi.hoisted(() => ({ add: vi.fn<(options: unknown) => void>() }))
 
@@ -35,7 +35,7 @@ async function approveFailingWith(error: unknown) {
     return null
   }
   await view.render(<Probe />)
-  await act(() => resolve(7, 'approve'))
+  await act(() => resolve.resolveAction({ id: 7, type: 'action' } as ActionLogEntry, 'approve'))
   expect(toasts.add).toHaveBeenCalledTimes(1)
   return toasts.add.mock.calls[0][0] as { title: string, description?: string, variant: string }
 }

@@ -5,6 +5,7 @@ import type {
   ActionLogEntry, ActionState, CreationApproval, Overseer,
 } from '@gadgets/workshop-shared/api'
 import { CreationAccountModal } from './components/CreationAccountModal'
+import { failureReason } from './p5-actionFailureReason'
 
 type ActionDecision = 'approve' | 'deny'
 
@@ -32,7 +33,7 @@ export function useResolveAction(
       onResolvedRef.current?.(actionId, decision === 'approve' ? 'approved' : 'rejected')
     } catch (error) {
       console.error(`Failed to ${decision} action:`, error)
-      toasts.add({ title: `Failed to ${decision} action`, variant: 'error' })
+      toasts.add({ title: `Failed to ${decision} action`, description: failureReason(error), variant: 'error' })
     } finally {
       setProcessing(previous => {
         const next = new Set(previous)
