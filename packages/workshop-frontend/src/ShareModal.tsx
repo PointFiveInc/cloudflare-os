@@ -22,6 +22,7 @@ import { isImeComposing } from './keyboardEvent'
 import { useServerConfig } from './ServerConfigContext'
 import { useUserDirectorySearch } from './features/user-directory/useUserDirectorySearch'
 import { P5_OWNER_ONLY_NOTICE, P5_WORKSPACE_ROLE_TEXT } from './p5-owner-only'
+import { NoGadgetsWarning, NotListedHint } from './p5-screen-fixes'
 
 type CollaboratorRow =
   | { kind: 'owner'; profile: AiChatAuthorInfo }
@@ -1211,6 +1212,8 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
               ))}
             </p>
           )}
+          <NotListedHint />
+          <NoGadgetsWarning overseer={overseer} open={open && canInvite} role={addRole} />
 
           {invitedNames.length > 0 && (
             <div className="themed-compact-shadow mt-2 flex flex-wrap items-center gap-3 rounded-2xl border border-kumo-line/80 bg-kumo-base px-3 py-2.5 share-fade-in">
