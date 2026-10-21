@@ -7,6 +7,7 @@ import { useAuthenticatedApi } from '../AuthContext'
 import { GadgetMetadataWithTimestamps, BlueprintPublicInfo, Overseer, AiChatAuthorInfo, NotificationMute } from '@gadgets/workshop-shared/api'
 import { WorkspaceNotificationsMenu } from '../features/notifications/WorkspaceNotificationsMenu'
 import { describeMute } from '../features/notifications/notificationMute'
+import { useP5Mark } from '../p5-marks'
 import ShareModal from '../ShareModal'
 import { p5OffersShare } from '../p5-owner-only'
 import { BindingBadge, getGradient as getBlueprintGradient, uniqueBindingBadges } from './BlueprintCard'
@@ -55,6 +56,7 @@ function AppRow({
   onRename: (gadget: GadgetMetadataWithTimestamps, newTitle: string) => void
   onNotificationMuteChange: (gadget: GadgetMetadataWithTimestamps, mute: NotificationMute | undefined) => void
 }) {
+  const p5Mark = useP5Mark(gadget)
   const [isRenaming, setIsRenaming] = useState(false)
   const [renameValue, setRenameValue] = useState(gadget.title || '')
   const renameInputRef = useRef<HTMLInputElement>(null)
@@ -87,6 +89,7 @@ function AppRow({
         // Prevent navigation when renaming or clicking the menu
         if (isRenaming) e.preventDefault()
       }}
+      search={p5Mark.search}
     >
       {/* Neutral monogram */}
       <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kumo-fill text-[12px] font-medium text-kumo-subtle">
@@ -125,6 +128,7 @@ function AppRow({
             Shared by {gadget.owner.name}
           </p>
         )}
+        {p5Mark.label}
       </div>
 
       {/* Time */}
