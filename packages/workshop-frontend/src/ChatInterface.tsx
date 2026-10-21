@@ -1760,7 +1760,7 @@ const ToolGroupRow = memo(function ToolGroupRow({
         )
       )}
       {footerChangeSequence !== undefined && footerTimestamp && footerLabel && onFooterRevert && (
-        <div className="ml-0 mt-0.5 flex items-center gap-1 opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
+        <div className="ml-0 mt-0.5 flex items-center gap-1 opacity-100 transition-opacity duration-150 ease-out">
           <Tooltip content={footerLabel} asChild>
             <button
               type="button"
@@ -4701,14 +4701,6 @@ function ChatInterface({
     return out;
   }, [currentMessages, isAgentActive]);
 
-  const latestCompletedAgentTurnMessageSeq = useMemo(() => {
-    let latest: number | null = null;
-    for (const sequence of completedAgentTurnMessageSeqs) {
-      if (latest === null || sequence > latest) latest = sequence;
-    }
-    return latest;
-  }, [completedAgentTurnMessageSeqs]);
-
   // The current epoch's opening sequence (see ChatCodeBase.epoch), zero when the epoch spans the
   // whole chat. A *pending* changes message before it exists only in chats converted from
   // pre-git storage -- its content rides the conversion boundary's collapsed change, and the
@@ -5830,7 +5822,7 @@ function ChatInterface({
                               <span className="min-w-0 truncate font-medium">
                                 {label}
                               </span>
-                              <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover/savedChanges:opacity-100 sm:group-focus-within/savedChanges:opacity-100">
+                              <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition-opacity duration-150 ease-out">
                                 {/* Edits from before the current epoch (i.e. before the chat's
                                     conversion to git-backed storage) can't be discarded
                                     individually -- only the banner's discard-all covers them. */}
@@ -5947,7 +5939,7 @@ function ChatInterface({
                               </span>
                             </div>
                             {endsUserGroup && (
-                              <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover/message:opacity-100 sm:group-focus-within/message:opacity-100">
+                              <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out">
                                 {!(hideOwnUserName && msg.author.id === currentUser?.id) && (
                                   <span className="font-medium">{msg.author.name}</span>
                                 )}
@@ -5998,7 +5990,7 @@ function ChatInterface({
                                 )}
                               </div>
                               {endsUserGroup && (
-                                <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover/message:opacity-100 sm:group-focus-within/message:opacity-100">
+                                <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out">
                                   {/* hideOwnUserName implies currentUser is non-null (see memo). */}
                                   {!(hideOwnUserName && msg.author.id === currentUser?.id) && (
                                     <span className="font-medium">{msg.author.name}</span>
@@ -6032,8 +6024,6 @@ function ChatInterface({
                             const showActions =
                               completedAgentTurnMessageSeqs.has(actionMessageSeq) &&
                               (hasMessageText || (!!pendingChange && !attachActionsToToolGroups));
-                            const keepActionsVisible =
-                              actionMessageSeq === latestCompletedAgentTurnMessageSeq;
                             const showFooterOnGroupIndex = attachActionsToToolGroups && pendingChange && messageToolGroups
                               ? messageToolGroups.length - 1
                               : -1;
@@ -6055,11 +6045,7 @@ function ChatInterface({
                               )}
 
                               {showActions && (
-                                <div className={`mt-0.5 -ml-1 flex items-center gap-1 transition-opacity duration-150 ease-out ${
-                                  keepActionsVisible
-                                    ? "opacity-100"
-                                    : "opacity-100 sm:opacity-0 sm:group-hover/agentMessage:opacity-100 sm:group-focus-within/agentMessage:opacity-100"
-                                }`}>
+                                <div className="mt-0.5 -ml-1 flex items-center gap-1 transition-opacity duration-150 ease-out opacity-100">
                                   {hasMessageText && (
                                     <Tooltip content="Copy message" asChild>
                                       <button
