@@ -62,6 +62,7 @@ import {
 import { useComposerResources } from "./useComposerResources";
 import { useComposerEditorLayout } from "./useComposerEditorLayout";
 import styles from "./ChatComposer.module.css";
+import { NoAgentLine } from "../../../p5-screen-fixes";
 
 // A capsule's text begins with an em space, which reserves the box the mirror paints the vendor
 // logo into, and a no-break space, which is the gap between the logo and the title. The word
@@ -750,6 +751,7 @@ export const ChatComposer = ({
           </div>
         )}
         {draftUpdateBanner}
+        <NoAgentLine noAgent={selectedModel == null} agentActive={isAgentActive} />
         {sendHiccup && sendHiccup.chatKey === chatKey && (
           <div className="px-4 pt-2 text-xs text-kumo-warning">
             {/* Composers without a chatKey (new-chat, home page) have no thread to check. */}
