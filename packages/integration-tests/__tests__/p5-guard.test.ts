@@ -266,4 +266,29 @@ describe("Cloudflare code PointFive's changes lean on", () => {
       sharingManagersInGetSharingManager: 1,
     });
   });
+
+  it("share safety: one connection lookup, in newGatekeeper; the one add, in addCollaborator; one creation applied",
+      () => {
+    const backend = cloudflareSources(BACKEND);
+    const overseer = sourceAt(backend, `${BACKEND}/overseer.ts`);
+    const userFile = `${BACKEND}/user.ts`;
+    const found = {
+      lookupCallers: occurrences(backend.filter(source => source.path !== userFile), "getGatekeeperClassFor("),
+      lookupCallersInNewGatekeeper: occurrences([memberBody(overseer, "newGatekeeper")], "getGatekeeperClassFor("),
+      lookupInUserFile: occurrences([sourceAt(backend, userFile)], "getGatekeeperClassFor("),
+      addsInAddCollaborator: occurrences([memberBody(overseer, "addCollaborator")], ".addCollaborator("),
+      creationsApplied: occurrences(backend, "applyCreation("),
+    };
+
+    expect(Object.fromEntries(Object.entries(found).map(([pin, places]) => [pin, places.length])),
+      "a new way to connect an account's resource, to add someone, or to apply a created resource skips " +
+      "p5-share-safety.ts: re-check it and its hooks in newGatekeeper and addCollaborator. user.ts holds the " +
+      `lookup's definition and the vendor call it makes. Found: ${JSON.stringify(found, null, 2)}`).toEqual({
+      lookupCallers: 1,
+      lookupCallersInNewGatekeeper: 1,
+      lookupInUserFile: 2,
+      addsInAddCollaborator: 1,
+      creationsApplied: 1,
+    });
+  });
 });

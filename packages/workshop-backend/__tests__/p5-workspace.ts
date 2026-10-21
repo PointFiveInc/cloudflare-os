@@ -19,11 +19,23 @@ declare global {
 
 /** `user` is a fresh stub on each read: a stub made in one Durable Object's context cannot be used in another's. */
 export type Person = { readonly user: DurableObjectStub<UserDurableObject>; profile: AiChatAuthorInfo; token: string };
+/**
+ * A connection as the Workshop stores it. One made by `newGatekeeper` keeps its resource and its resource type's real
+ * `urlPattern`; an ambient one, such as Context or a wrapper kit connector, keeps only its vendor.
+ */
+export type Connection =
+  | { vendorId: string; typeUrlPattern: string; resourceUrl: string }
+  | { vendorId: string; ambient: true };
 export type Workspace = {
   id: string;
   impl: any;
   open(person: Person, shareKey?: string): Promise<Overseer & Disposable>;
   share(person: Person, role: CollaboratorRole, edge?: PermissionEdge): void;
+  /**
+   * Stores `connection`'s record, with no gatekeeper running behind it, and returns its id. With `inGadget`, a gadget
+   * binds it too, which puts it in "Gadget only" people's scope.
+   */
+  connect(connection: Connection, options?: { inGadget?: boolean }): number;
   /** Sets `P5_COLLABORATION` on this workspace's Overseer, as os.pointfive.co's deploy does, from here on. */
   switchOn(): void;
   /** Each restart the workspace asked for. A real one would abort the Durable Object under the test. */
@@ -71,6 +83,26 @@ export async function inWorkspace(owner: Person, test: (workspace: Workspace) =>
           person.user.id.toString(), person.profile.id, notifyClosed, shareKey) as Promise<Overseer & Disposable>,
       share(person, role, edge = { type: "user", sharer: owner.profile.id, created: new Date(), role }) {
         impl.storage.collaborators.put({ profile: person.profile, addedBy: [edge] });
+      },
+      connect(connection, { inGadget = false } = {}) {
+        let gatekeeperId = impl.allocateWorkpieceId();
+        impl.storage.gatekeepers.put("ambient" in connection
+          ? {
+            id: gatekeeperId, resourceTitle: connection.vendorId, class: {},
+            creationSpec: { type: "ambient", vendorId: connection.vendorId, accountId: 1 },
+          }
+          : {
+            id: gatekeeperId, resourceTitle: connection.resourceUrl, resourceUrl: connection.resourceUrl, class: {},
+            creationSpec: { type: "gatekeeper", ...connection },
+          });
+        if (inGadget) {
+          let gadgetId = impl.allocateWorkpieceId();
+          impl.storage.gadgets.put({
+            type: "gadget", id: gadgetId, title: `Gadget ${gadgetId}`, created: new Date(),
+            bindingName: `GADGET_${gadgetId}`, bindings: { [`CONNECTION_${gatekeeperId}`]: { target: gatekeeperId } },
+          });
+        }
+        return gatekeeperId;
       },
       switchOn() {
         let switched = { ...impl.env, P5_COLLABORATION: "true" };
