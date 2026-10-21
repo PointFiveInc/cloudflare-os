@@ -25,6 +25,7 @@ import {
   DEVICE_HANDOFF_LIFETIME_MS, isDeviceHandoffState, sealDeviceSessionHandoff,
   type DeviceSessionCredential, type DeviceSessionHandoff,
 } from "./auth/device-session-handoff.js";
+import { p5ApplyMark, type P5MarkChange } from "./p5-marks.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -619,6 +620,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       this.storage.outputs.byWorkspace.delete(gadgetId);
     }
   }
+
+  async p5Mark(gadgetId: string, change: P5MarkChange): Promise<void> { return p5ApplyMark(this, this.storage.gadgets, gadgetId, change); }
 
   async setOwnDisplayName(name: string): Promise<void> {
     let profile = this.storage.profile.get();

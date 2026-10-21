@@ -79,6 +79,7 @@ import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
 import { p5OwnerOnly } from "./p5-owner-only";
 import { refuseUnsafeConnect, refuseUnsafeShare } from "./p5-share-safety";
+import { p5ForgetSharedListings, p5LeaveShareMark } from "./p5-marks";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -11481,6 +11482,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         await this.disableHook(record.id);
       }
     }
+    await p5ForgetSharedListings(this.impl);
 
     await this.impl.ctx.blockConcurrencyWhile(async () => {
       await this.#owner.deleteGadget(this.impl.ctx.id.toString());
@@ -12588,12 +12590,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     await refuseUnsafeShare(this.impl, profile, role);
 
-    return (await this.impl.getSharingManager()).addCollaborator({
+    let added = (await this.impl.getSharingManager()).addCollaborator({
       caller: this.#sharingCaller(),
       profile,
       role,
       note,
     });
+    await p5LeaveShareMark(this.impl, userDo, added.role ?? role, this.#getClientProfile());
+    return added;
   }
 
   async previewRemoveCollaborator(profileId: string): Promise<AffectedCollaborator[]> {

@@ -291,4 +291,19 @@ describe("Cloudflare code PointFive's changes lean on", () => {
       creationsApplied: 1,
     });
   });
+
+  it("marks: one workspace open in the Worker, in #openGadgetInternal", () => {
+    const server = sourceAt(cloudflareSources(BACKEND), `${BACKEND}/server.ts`);
+    const found = {
+      opens: occurrences([server], "overseer.open("),
+      opensInOpenGadgetInternal: occurrences([memberBody(server, "#openGadgetInternal")], "overseer.open("),
+    };
+
+    expect(Object.fromEntries(Object.entries(found).map(([pin, places]) => [pin, places.length])),
+      "a new way for the Worker to open a workspace skips the mark clear in p5-marks.ts: re-check it and " +
+      `its hook in #openGadgetInternal. Found: ${JSON.stringify(found, null, 2)}`).toEqual({
+      opens: 1,
+      opensInOpenGadgetInternal: 1,
+    });
+  });
 });
