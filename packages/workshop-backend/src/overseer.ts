@@ -78,6 +78,7 @@ import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
 import { p5OwnerOnly } from "./p5-owner-only";
+import { refuseUnsafeConnect, refuseUnsafeShare } from "./p5-share-safety";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -11570,6 +11571,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       : Promise<GatekeeperClient<any> | null> {
     let {class: cls, vendorId, typeUrlPattern} =
         await this.#clientUser.getGatekeeperClassFor(accountId, resourceUrl);
+    await refuseUnsafeConnect(this.impl, vendorId, typeUrlPattern);
     let creationSpec: GatekeeperCreationSpec = {
       type: "gatekeeper",
       vendorId,
@@ -12584,6 +12586,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!profile) {
       return null;
     }
+    await refuseUnsafeShare(this.impl, profile, role);
 
     return (await this.impl.getSharingManager()).addCollaborator({
       caller: this.#sharingCaller(),
