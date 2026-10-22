@@ -81,6 +81,7 @@ import { p5OwnerOnly } from "./p5-owner-only";
 import { refuseUnsafeConnect, refuseUnsafeShare } from "./p5-share-safety";
 import { p5ForgetSharedListings, p5LeaveMentionMarks, p5LeaveShareMark } from "./p5-marks";
 import { p5AtMention } from "./p5-at-mentions";
+import { p5ConnectGadgetViewer } from "./p5-viewer-call";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -4708,7 +4709,9 @@ class OverseerImpl implements AgentHooks {
         return (...args: any[]) => {
           let result: Promise<any>;
           if (viewer) {
-            let pending = viewerSession ??= connectGadgetViewer(target, viewer).catch(err => {
+            let pending = viewerSession ??= p5ConnectGadgetViewer(target, viewer, connectGadgetViewer,
+                () => self.readGadgetFiles(gadgetId,
+                    self.#resolveGadgetChatId(gadgetId, self.#runningChatIds.get(gadgetId) ?? undefined))).catch(err => {
               viewerSession = undefined;
               throw err;
             });
