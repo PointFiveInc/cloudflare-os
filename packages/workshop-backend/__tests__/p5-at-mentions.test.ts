@@ -73,14 +73,17 @@ function warnedEvents(warn: MockInstance<typeof console.warn>): unknown[] {
   return warn.mock.calls.map(([entry]) => (entry as { event?: unknown } | undefined)?.event);
 }
 
-/** The model's answers, "Done." each time, held until `answering` resolves. Returns how many were asked for. */
-function modelAnswers(answering: Promise<void>): () => number {
-  let asked = 0;
+/**
+ * The model's answers, "Done." each time, held until `answering` resolves. `prompts` holds each request's body, in the
+ * order the model was asked.
+ */
+function modelAnswers(answering: Promise<void>): { asked(): number; prompts: Promise<string>[] } {
+  let prompts: Promise<string>[] = [];
   let fetch = globalThis.fetch;
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
     let url = new URL(input instanceof Request ? input.url : input);
     if (url.origin !== MODEL.config.apiUrl) return fetch(input, init);
-    asked++;
+    prompts.push(new Request(input, init).text());
     let events = [
       { type: "message_start", message: { id: "answer", type: "message", role: "assistant", model: CLAUDE,
         content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } },
@@ -93,8 +96,13 @@ function modelAnswers(answering: Promise<void>): () => number {
     let body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
     return answering.then(() => new Response(body, { headers: { "content-type": "text/event-stream" } }));
   });
-  return () => asked;
+  return { asked: () => prompts.length, prompts };
 }
+
+const ONLY_THE_SENDER_OR_NOBODY: [string, string][] = [
+  ["only its sender", "@Alex Levi a note to myself: page 9"],
+  ["nobody in the chat", "Ask @Carol Stone, or mail bob@dana.com"],
+];
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -179,6 +187,19 @@ describe("a message that names no one else in the chat runs the agent's turn as 
       expect(await markOf(bob, workspace.id)).toBeUndefined();
     });
   });
+
+  it.each(ONLY_THE_SENDER_OR_NOBODY)("an \"@\" of %s, sent in a chat with no turn running, starts one",
+      async (_named, message) => {
+    await inChat(async ({ alex, bob, dana, workspace, owner, turns, modelsAsked }) => {
+      let chatId = await owner.newChat("Numbers for the quarter", null);
+      expect(await settled(owner.sendChatMessage(chatId, message, CLAUDE))).toBe("sent");
+      expect(turns).toHaveBeenCalledTimes(1);
+      expect(workspace.impl.storage.chatMeta.get(chatId).activeAgent).toEqual(MODEL.profile);
+      expect(modelsAsked()).toEqual([null, CLAUDE]);
+      expect(said(workspace, chatId)).toEqual([["Alex Levi", "Numbers for the quarter"], ["Alex Levi", message]]);
+      for (let person of [alex, bob, dana]) expect(await markOf(person, workspace.id)).toBeUndefined();
+    });
+  });
 });
 
 describe("when the people in the chat cannot be read", { timeout: 90_000 }, () => {
@@ -214,7 +235,7 @@ describe("when the people in the chat cannot be read", { timeout: 90_000 }, () =
 describe("while the agent works", { timeout: 90_000 }, () => {
   it("an \"@\" meets Cloudflare's refusal: it is never steered or queued, and marks no one", async () => {
     let answer!: () => void;
-    let asked = modelAnswers(new Promise(resolve => { answer = resolve; }));
+    let { asked } = modelAnswers(new Promise(resolve => { answer = resolve; }));
     await inChat(async ({ bob, workspace, owner }) => {
       let chatId = await owner.newChat("Work out the totals", CLAUDE);
       await vi.waitFor(() => expect(asked()).toBe(1));
@@ -229,6 +250,26 @@ describe("while the agent works", { timeout: 90_000 }, () => {
       expect(said(workspace, chatId).filter(([author]) => author === "Alex Levi").map(([, text]) => text))
           .toEqual(["Work out the totals", "Make it dark."]);
       expect(await markOf(bob, workspace.id)).toBeUndefined();
+    }, { agentRuns: true });
+  });
+
+  it.each(ONLY_THE_SENDER_OR_NOBODY)("an \"@\" of %s is sent and steers, and the agent reads it at its next step",
+      async (_named, message) => {
+    let answer!: () => void;
+    let model = modelAnswers(new Promise(resolve => { answer = resolve; }));
+    await inChat(async ({ alex, bob, dana, workspace, owner }) => {
+      let chatId = await owner.newChat("Work out the totals", CLAUDE);
+      await vi.waitFor(() => expect(model.asked()).toBe(1));
+      expect(await settled(owner.sendChatMessage(chatId, message, CLAUDE))).toBe("sent");
+      expect(workspace.impl.storage.chatMeta.get(chatId).queuedSteers.map(({ text }: { text: string }) => text))
+          .toEqual([message]);
+      answer();
+      await workspace.impl.waitForAllAgentsToComplete();
+      expect(model.asked()).toBe(2);
+      expect(await model.prompts[1]).toContain(JSON.stringify(message));
+      expect(said(workspace, chatId).filter(([author]) => author === "Alex Levi").map(([, text]) => text))
+          .toEqual(["Work out the totals", message]);
+      for (let person of [alex, bob, dana]) expect(await markOf(person, workspace.id)).toBeUndefined();
     }, { agentRuns: true });
   });
 });
