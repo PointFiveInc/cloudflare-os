@@ -87,6 +87,13 @@ const SHARE_REFUSALS = [
   ['Salesforce', 'This workspace uses Salesforce, which can lock out everyone but the person who connected it; ' +
     'share a workspace without it instead.'],
 ]
+const TO_THE_AGENT: [string, Person, Person | undefined, string][] = [
+  ['an "@" of only its sender, the owner', OLIVE, undefined,
+    '@Olive Owner note to self: the totals for the third quarter are on page 9'],
+  ['an "@" of only its sender, a "Workspace" colleague', BOB, OLIVE,
+    '@Bob Baker note to self: the totals for the third quarter are on page 9'],
+  ['an "@" naming nobody in the chat', OLIVE, undefined, 'Ask @Una Usher or @Dana Levy, or mail bob@dana.com'],
+]
 const REVIEW: SlashCommandChoice = {
   selection: { gatekeeperId: 42, commandId: 'review' },
   name: 'review',
@@ -743,6 +750,26 @@ describe('while the agent works', { timeout: 20_000 }, () => {
     await press(textarea, 'Enter')
     await waitFor(() => expect(onSend).toHaveBeenCalledWith('make it dark', 'model-a', undefined, undefined, undefined))
     expect(overseer.getMetadata).not.toHaveBeenCalled()
+  })
+})
+
+describe.each([
+  { turn: 'mid-turn', isAgentActive: true, goesOn: 'to steer the turn, with no wait line' },
+  { turn: 'idle', isAgentActive: false, goesOn: 'to start a turn, with no "Goes to" line' },
+])('$turn, an "@" that names nobody else in the chat goes to the agent', { timeout: 20_000 }, ({ isAgentActive, goesOn }) => {
+  it.each(TO_THE_AGENT)(`%s is sent ${goesOn}`, async (_, sender, owner, message) => {
+    testState.currentUser = sender
+    const overseer = makeOverseer(owner)
+    const { textarea, onSend } = await renderComposer(overseer, { isAgentActive })
+    await setText(textarea, message)
+    await waitFor(() => expect(overseer.listCollaborators).toHaveBeenCalled())
+    await settle()
+    expect(mentionList()).toBeNull()
+    expect(hint()).toBeNull()
+    await press(textarea, 'Enter')
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith(message, 'model-a', undefined, undefined, undefined))
+    expect(overseer.addCollaborator).not.toHaveBeenCalled()
+    expect(textarea.value).toBe('')
   })
 })
 
