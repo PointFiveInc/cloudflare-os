@@ -79,7 +79,8 @@ import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
 import { p5OwnerOnly } from "./p5-owner-only";
 import { refuseUnsafeConnect, refuseUnsafeShare } from "./p5-share-safety";
-import { p5ForgetSharedListings, p5LeaveShareMark } from "./p5-marks";
+import { p5ForgetSharedListings, p5LeaveMentionMarks, p5LeaveShareMark } from "./p5-marks";
+import { p5AtMention } from "./p5-at-mentions";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -12269,10 +12270,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
                 formats?: MessageFormatRef[]): Promise<number> {
+    let mentioned = await p5AtMention(this.impl, await this.#getClientProfile(), initialMessage);
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
-    return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
+        () => this.#clientUser.getChatContext(mentioned.length ? null : chosenModelId), this.impl.logger);
+    let chatId = await this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
                              undefined, undefined, formats);
+    if (mentioned.owner) {
+      await p5LeaveMentionMarks(this.impl, chatId, false, userMeta.profile, mentioned, mentioned.owner);
+    }
+    return chatId;
   }
 
   async sendChatMessage(
@@ -12282,14 +12288,18 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // A steer runs on the running turn's model, so it is queued before the sender's model is
     // looked up: a collaborator need not have that model.
     let author = await this.#getClientProfile();
-    if (this.impl.steerRunningTurn(
+    let mentioned = await p5AtMention(this.impl, author, message);
+    if (!mentioned.length && this.impl.steerRunningTurn(
         chatId, this.clientUserId, author, message, capsules, attachments, formats)) {
       return;
     }
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
-    return this.impl.sendChatMessage(
+        () => this.#clientUser.getChatContext(mentioned.length ? null : chosenModelId), this.impl.logger);
+    await this.impl.sendChatMessage(
         this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
+    if (mentioned.owner) {
+      await p5LeaveMentionMarks(this.impl, chatId, true, author, mentioned, mentioned.owner);
+    }
   }
 
   async setChatTitle(chatId: number, title: string): Promise<void> {

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 const PACKAGES = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const BACKEND = "workshop-backend/src";
+const SHARED = "workshop-shared/src";
 
 type Source = {
   path: string;
@@ -161,12 +162,11 @@ function within(source: Source, from: number, to: number): Source {
   return { path: source.path, code: keep(source.code), masked: keep(source.masked) };
 }
 
-/** The body of the method or function `name` declared in `source`, or nothing when there is none. */
-function memberBody(source: Source, name: string): Source {
-  const modifiers = "(?:(?:export|public|private|protected|static|override|async|function)\\s+)*";
-  const header = new RegExp(`^[ \\t]*${modifiers}${name}\\s*[(<][^;{]*\\{`, "m").exec(source.masked);
-  if (header === null) return within(source, 0, 0);
-  const open = header.index + header[0].length - 1;
+/** The braces that open at the end of `header`'s first match in `source`, or nothing when it has none. */
+function bracedAfter(source: Source, header: RegExp): Source {
+  const found = header.exec(source.masked);
+  if (found === null) return within(source, 0, 0);
+  const open = found.index + found[0].length - 1;
   let depth = 0;
   for (let at = open; at < source.masked.length; at++) {
     if (source.masked[at] === "{") depth++;
@@ -175,10 +175,51 @@ function memberBody(source: Source, name: string): Source {
   return within(source, 0, 0);
 }
 
+/** The body of the method or function `name` declared in `source`, or nothing when there is none. */
+function memberBody(source: Source, name: string): Source {
+  const modifiers = "(?:(?:export|public|private|protected|static|override|async|function)\\s+)*";
+  return bracedAfter(source, new RegExp(`^[ \\t]*${modifiers}${name}\\s*[(<][^;{]*\\{`, "m"));
+}
+
+/** The body of the class or interface `name` declared in `source`, or nothing when there is none. */
+function typeBody(source: Source, name: string): Source {
+  return bracedAfter(source, new RegExp(`^(?:export\\s+)?(?:class|interface)\\s+${name}\\b[^{]*\\{`, "m"));
+}
+
+/** Each declaration of the method `name` in an interface's `body`, up to its `;`, whitespace collapsed. */
+function declarations(body: Source, name: string): string[] {
+  return [...body.code.matchAll(new RegExp(`^[ \\t]*${name}\\s*[(<][^;]*;`, "gm"))]
+    .map(([declaration]) => declaration.replace(/\s+/g, " ").trim());
+}
+
 function sourceAt(sources: Source[], path: string): Source {
   const source = sources.find(entry => entry.path === path);
   if (source === undefined) throw new Error(`${path} is not among Cloudflare's sources`);
   return source;
+}
+
+/**
+ * A person's two ways into a chat, as Cloudflare's `Overseer` interface declares them. Every hook on
+ * a person's message sits in the client's implementations of these two.
+ */
+const CHAT_ENTRY_POINTS = {
+  newChat: [
+    "newChat(initialMessage: string | SlashCommandRequest, modelId: string | null, capsules?: " +
+      "CapsuleSpecifier[], attachments?: ChatAttachmentHandle[], formats?: MessageFormatRef[]): Promise<number>;",
+  ],
+  sendChatMessage: [
+    "sendChatMessage(chatId: number, message: string | SlashCommandRequest, modelId: string | null, " +
+      "capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[], formats?: MessageFormatRef[]): " +
+      "Promise<void>;",
+  ],
+};
+
+function chatEntryPoints(): typeof CHAT_ENTRY_POINTS {
+  const overseer = typeBody(sourceAt(cloudflareSources(SHARED), `${SHARED}/api.ts`), "Overseer");
+  return {
+    newChat: declarations(overseer, "newChat"),
+    sendChatMessage: declarations(overseer, "sendChatMessage"),
+  };
 }
 
 describe("the source walker", () => {
@@ -239,6 +280,31 @@ describe("the source walker", () => {
     expect(occurrences([source], "new Thing(")).toEqual(["example.ts:5", "example.ts:7"]);
     expect(occurrences([memberBody(source, "target")], "new Thing(")).toEqual(["example.ts:5"]);
     expect(occurrences([memberBody(source, "missing")], "new Thing(")).toEqual([]);
+  });
+
+  it("finds a class's or an interface's body, a member inside it, and an interface's declarations", () => {
+    const source = {
+      path: "example.ts",
+      ...lex([
+        "class First { target() { new Thing(); } }",
+        "export class Second extends First implements Shape {",
+        "  async target(): Promise<void> { new Thing(\"{\"); }",
+        "}",
+        "export interface Shape extends Base {",
+        "  /** Gone. */",
+        "  target(",
+        "      first: string | null, // gone",
+        "      second?: number[]): Promise<void>;",
+        "  other(): void;",
+        "}",
+      ].join("\n")),
+    };
+
+    expect(occurrences([memberBody(typeBody(source, "Second"), "target")], "new Thing(")).toEqual(["example.ts:3"]);
+    expect(occurrences([typeBody(source, "Secon")], "new Thing(")).toEqual([]);
+    expect(declarations(typeBody(source, "Shape"), "target"))
+      .toEqual(["target( first: string | null, second?: number[]): Promise<void>;"]);
+    expect(declarations(typeBody(source, "Shape"), "missing")).toEqual([]);
   });
 });
 
@@ -305,5 +371,41 @@ describe("Cloudflare code PointFive's changes lean on", () => {
       opens: 1,
       opensInOpenGadgetInternal: 1,
     });
+  });
+
+  it("\"@\": one steer, behind the mention check in the client's sendChatMessage, and two calls each of newChat " +
+      "and sendChatMessage, one in each client wrapper", () => {
+    const backend = cloudflareSources(BACKEND);
+    const client = typeBody(sourceAt(backend, `${BACKEND}/overseer.ts`), "OverseerClientInterface");
+    const clientNewChat = memberBody(client, "newChat");
+    const clientSendChatMessage = memberBody(client, "sendChatMessage");
+    const found = {
+      steers: occurrences(backend, ".steerRunningTurn("),
+      steersBehindTheMentionCheck: occurrences([clientSendChatMessage],
+        "if (!mentioned.length && this.impl.steerRunningTurn("),
+      newChats: occurrences(backend, ".newChat("),
+      newChatsInTheClientNewChat: occurrences([clientNewChat], ".newChat("),
+      sendChatMessages: occurrences(backend, ".sendChatMessage("),
+      sendChatMessagesInTheClientSendChatMessage: occurrences([clientSendChatMessage], ".sendChatMessage("),
+    };
+
+    expect(Object.fromEntries(Object.entries(found).map(([pin, places]) => [pin, places.length])),
+      "a new way to steer a running turn, or to send a person's message into a chat, skips p5-at-mentions.ts, so " +
+      "an \"@\" could reach the agent: re-check it and its hooks in the client's newChat and sendChatMessage. The " +
+      "other newChat and sendChatMessage are the external message entry, which stays unhooked. " +
+      `Found: ${JSON.stringify(found, null, 2)}`).toEqual({
+      steers: 1,
+      steersBehindTheMentionCheck: 1,
+      newChats: 2,
+      newChatsInTheClientNewChat: 1,
+      sendChatMessages: 2,
+      sendChatMessagesInTheClientSendChatMessage: 1,
+    });
+  });
+
+  it("the chat entry points: the Overseer declares newChat and sendChatMessage once each, as the hooks expect",
+      () => {
+    expect(chatEntryPoints(), "a changed or added chat entry point can carry a person's message past the hooks " +
+      "in the client's newChat and sendChatMessage: re-check every p5- hook there").toEqual(CHAT_ENTRY_POINTS);
   });
 });
