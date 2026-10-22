@@ -19,3 +19,13 @@ export function workshopSwitchOn(patch?: WorkshopPatch): WorkshopPatch {
     config.vars = { ...config.vars, ...COLLABORATION_SWITCH };
   };
 }
+
+/**
+ * Context's `GatekeeperSpec` patch. It drops the build, so the harness boots the validated tree the
+ * task graph built before any test file ran, as Cloudflare's own Context suites do, and adds the
+ * switch to whatever vars the config holds.
+ */
+export function contextSwitchOn(config: WorkerConfig): void {
+  delete config.build;
+  config.vars = { ...config.vars, ...COLLABORATION_SWITCH };
+}
