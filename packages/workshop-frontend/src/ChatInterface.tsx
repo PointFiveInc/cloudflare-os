@@ -123,6 +123,7 @@ import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDi
 import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
 import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
 import { useP5AtMentionPeople, withP5AtMentions, type AtMentionCandidate } from "./p5-at-mentions";
+import { useP5ShowsPendingChangesBar } from "./p5-turn-end-accept";
 
 /**
  * The selected chat's live (accepted but not yet materialized) change row stream, delivered via
@@ -3297,6 +3298,7 @@ function ChatInterface({
       provisionalToolCalls.length > 0);
 
   const isAgentActive = !!currentChatMetadata?.activeAgent;
+  const p5ShowsPendingChangesBar = useP5ShowsPendingChangesBar(isAgentActive);
   const activeAgent = currentChatMetadata?.activeAgent;
   // Names the chat's own model in the composer even when the picker no longer offers it.
   const chatAgent = activeAgent ?? inferChatAgentFromMessages(currentMessages);
@@ -6546,6 +6548,7 @@ function ChatInterface({
                       if (!currentChatMetadata ||
                           !(chatHasProposedChanges(currentChatMetadata) ||
                             hasPendingBlueprintProposal)) return null;
+                      if (!p5ShowsPendingChangesBar) return null;
 
                       // Accepting always merges everything the chat proposes (drafts swept in,
                       // no partial accepts -- see Overseer.mergeChanges()), so the banner needs
