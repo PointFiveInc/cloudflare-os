@@ -122,6 +122,7 @@ import {
 import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDialog";
 import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
 import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
+import { useP5AtMentionPeople, withP5AtMentions, type AtMentionCandidate } from "./p5-at-mentions";
 
 /**
  * The selected chat's live (accepted but not yet materialized) change row stream, delivered via
@@ -1212,10 +1213,11 @@ const MARKDOWN_COMPONENTS_NO_CAPSULES = getMarkdownComponents();
  * `whitespace-pre-wrap` wrapper at the user-message render site renders it as a hard break.
  */
 export const MarkdownMessage = memo(function MarkdownMessage(
-  { message, capsules, formats }: {
+  { message, capsules, formats, p5People }: {
     message: string;
     capsules?: CapsuleSpecifier[];
     formats?: MessageFormatRef[];
+    p5People?: readonly AtMentionCandidate[];
   },
 ): ReactNode {
   const tokenizedMessage = useMemo(
@@ -1240,7 +1242,7 @@ export const MarkdownMessage = memo(function MarkdownMessage(
   return (
     <ReactMarkdown
       skipHtml={true}
-      remarkPlugins={remarkPlugins}
+      remarkPlugins={withP5AtMentions(remarkPlugins, p5People, message)}
       components={components}
     >
       {tokenizedMessage?.markdown ?? message}
@@ -3140,6 +3142,7 @@ function ChatInterface({
     }
     return sawSelf;
   }, [currentMessages, currentUser, queuedSteers]);
+  const p5PeopleFor = useP5AtMentionPeople(overseer, currentMessages, queuedSteers);
 
   const lastMessageSequence = currentMessages[currentMessages.length - 1]?.sequence;
 
@@ -5985,6 +5988,7 @@ function ChatInterface({
                                       message={msg.message}
                                       capsules={msg.capsules}
                                       formats={msg.formats}
+                                      p5People={p5PeopleFor(msg.author.id)}
                                     />
                                   </div>
                                 )}
@@ -6479,7 +6483,7 @@ function ChatInterface({
                         <div key={index} className={`flex flex-col items-end ${sameAuthorAsPrevious ? "mt-2" : "mt-5"}`}>
                           <div className={`${userBubbleClassName} opacity-60`}>
                             <div className="whitespace-pre-wrap">
-                              <MarkdownMessage message={steer.text} />
+                              <MarkdownMessage message={steer.text} p5People={p5PeopleFor(steer.author.id)} />
                             </div>
                           </div>
                           {next?.author.id !== steer.author.id && (
