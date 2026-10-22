@@ -26,6 +26,7 @@ import {
 } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import { P5_CHAT_AUTHORS_GUIDANCE, p5SteeringMessages, p5WithAuthor } from "./p5-chat-authors";
+import { P5_PEOPLE_WITH_ACCESS_GUIDANCE, p5DescribePeopleWithAccess } from "./p5-people-with-access";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
@@ -264,6 +265,7 @@ async function describeBinding(
   let edge = info.bindings.find(binding => binding.name === name);
   if (edge) return hooks.describeBinding(envName, edge.target);
   if (name === GIT_BINDING_NAME) return hooks.describeGitBinding(envName);
+  if (name === "PEOPLE_WITH_ACCESS") return p5DescribePeopleWithAccess(envName);
   if (name === "GADGET") {
     // Unlike the gadget bindings in the agent's env, a gadget's env.GADGET is
     // the bare RPC stub.
@@ -3201,6 +3203,7 @@ async function runAgentPass(
           `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
+    systemPromptSlots[0] += `\n\n${P5_PEOPLE_WITH_ACCESS_GUIDANCE}`;
   }
 
   // Shared guidance precedes deployment instructions for both agent types.

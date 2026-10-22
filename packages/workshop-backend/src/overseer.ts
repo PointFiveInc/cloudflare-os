@@ -82,6 +82,7 @@ import { refuseUnsafeConnect, refuseUnsafeShare } from "./p5-share-safety";
 import { p5ForgetSharedListings, p5LeaveMentionMarks, p5LeaveShareMark } from "./p5-marks";
 import { p5AtMention } from "./p5-at-mentions";
 import { p5ConnectGadgetViewer } from "./p5-viewer-call";
+import { P5PeopleWithAccess, p5AddPeopleWithAccess, type P5PeopleWithAccessTarget } from "./p5-people-with-access";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -2581,6 +2582,7 @@ class OverseerImpl implements AgentHooks {
     // shadows it (see bindWorkpiece). The agent's describeBinding tool mirrors this order when
     // describing a gadget's bindings (see describeBinding in agent.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
+    p5AddPeopleWithAccess(env, this, caller);
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
     }
@@ -5313,6 +5315,7 @@ class OverseerImpl implements AgentHooks {
       case "git":
         return Promise.resolve(new GitImpl(this, () => this.#gitAuthorFor(caller)));
 
+      case "p5PeopleWithAccess": return Promise.resolve(new P5PeopleWithAccess(this));
       default:
         target satisfies never;
         throw new TypeError("Unknown binding target type.");
@@ -10932,7 +10935,7 @@ type BindingLoopbackTarget = {
   // A gadget binding's `exports` in the agent's executeCode env (see exports-session.ts).
   type: "exports";
   id: WorkpieceId;
-};
+} | P5PeopleWithAccessTarget;
 
 /**
  * Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
