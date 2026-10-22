@@ -32,7 +32,8 @@ export const CONTEXT_OBSERVER_DENIED =
  * collections are domain-wide; private collections admit their grantees and, when enabled, everyone
  * in the sharing domain. The prefix keeps markers recorded before this tracker moved to the kit.
  */
-export function contextObserverStrategy(kv: ObserverKv, sharingDomain: string): ObserverStrategy {
+export function contextObserverStrategy(
+    kv: ObserverKv, sharingDomain: string, maxObservers?: number): ObserverStrategy {
   return trackedCollectionObservers<Fetcher<ContextVerifierApi>>({
     kv,
     collectionPrefix: "observedCollection:",
@@ -40,5 +41,6 @@ export function contextObserverStrategy(kv: ObserverKv, sharingDomain: string): 
       verifier.hasCollectionsAccess(sharingDomain, [...collectionIds]),
     denyMessage: () => CONTEXT_OBSERVER_DENIED,
     vendorId: VENDOR_ID,
+    maxObservers,
   });
 }
