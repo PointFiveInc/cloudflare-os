@@ -83,6 +83,7 @@ import { p5ForgetSharedListings, p5LeaveMentionMarks, p5LeaveShareMark } from ".
 import { p5AtMention } from "./p5-at-mentions";
 import { p5ConnectGadgetViewer } from "./p5-viewer-call";
 import { P5PeopleWithAccess, p5AddPeopleWithAccess, type P5PeopleWithAccessTarget } from "./p5-people-with-access";
+import { p5InstanceInstructions, p5TurnEndAccept } from "./p5-turn-end-accept";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -1116,6 +1117,7 @@ class OverseerImpl implements AgentHooks {
       this.#unregisterRunningAgent(record.chatId, !!wait);
       this.#publishAgentTurnNotification(record.chatId, record.initiator, record.initiatorUserId);
       this.#finishAgentTurn(record.chatId);
+      p5TurnEndAccept(this, record.chatId, record.initiatorUserId);
       return;
     }
     if ((record.resumeAttempts ?? 0) >= AGENT_RESUME_MAX_ATTEMPTS) {
@@ -7490,6 +7492,7 @@ class OverseerImpl implements AgentHooks {
           // A failed turn logged its unread steers before its error (see postAgentErrorMessage),
           // so it starts no follow-up, which would likely fail the same way.
           this.#finishAgentTurn(chatId, {aiModel, initiator, initiatorUserId});
+          if (finished && !liveChat.cancelController.signal.aborted) p5TurnEndAccept(this, chatId, initiatorUserId);
         }
       }
     }
@@ -9294,7 +9297,7 @@ class OverseerImpl implements AgentHooks {
   async getInstanceInstructions(): Promise<string> {
     try {
       // Cheap single KV get from the mirror AdminSettings maintains; avoids the singleton DO.
-      return (await readAdminConfig(this.env)).instanceInstructions;
+      return p5InstanceInstructions(await readAdminConfig(this.env));
     } catch (err) {
       this.logger.warn("failed to read instance instructions", {
         event: "instance.instructions.read.failed", error: err,
