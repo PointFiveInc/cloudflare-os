@@ -9,6 +9,7 @@ import { isCloudflareLimitsEnabled } from "./ai-gateway-billing/config.js";
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { readAdminConfig } from "./admin-config.js";
 import { siteLogoImage } from "./site-logo.js";
+import { p5ServerToggles } from "./p5-admin-toggles.js";
 
 const logger = createWorkshopLogger("workshop.deployment.config");
 
@@ -48,6 +49,7 @@ export async function getServerConfig(env: Cloudflare.Env): Promise<ServerConfig
     getAuthVendors(env),
   ]);
   return {
+    ...p5ServerToggles(config),
     authVendors,
     passwordAuthEnabled: isPasswordAuthEnabled(env),
     cloudflareLimitsEnabled: isCloudflareLimitsEnabled(env),

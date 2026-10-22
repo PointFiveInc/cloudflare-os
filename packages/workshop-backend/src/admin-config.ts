@@ -14,6 +14,7 @@ import { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import { sanitizeBlueprintOutput } from "./blueprint-archive.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig, type FormatCuration } from "./storage-schema/admin-settings-storage.js";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { p5AdminToggles } from "./p5-admin-toggles.js";
 
 /**
  * Longest `agentHint` a promoted format may carry. Every enabled format's hint goes into the
@@ -336,6 +337,7 @@ export function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
     ? p.signupsEnabled
     : DEFAULT_ADMIN_CONFIG.signupsEnabled;
   return {
+    ...p5AdminToggles(p),
     signupsEnabled,
     userSearchEnabled: typeof p.userSearchEnabled === "boolean"
       ? p.userSearchEnabled
