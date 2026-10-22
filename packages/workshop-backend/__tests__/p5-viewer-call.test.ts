@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { RpcSession } from "capnweb";
 import { diffFiles, type CodeContent } from "@gadgets/workshop-shared/code-change";
+import { receiveFromBrowser, sendToBrowser, waitForClientModule } from "../src/generated/browser-export-page.js";
 import { inWorkspace, signedIn, type Person, type Workspace } from "./p5-workspace.js";
+
+const launch = vi.hoisted(() => vi.fn());
+vi.mock("@cloudflare/puppeteer", () => ({ launch }));
 
 const SESSION = `
 import { RpcTarget } from "cloudflare:workers";
@@ -80,6 +85,9 @@ export class Viewed extends DurableObject {
 `,
 };
 
+const RENDERS_ITS_VIEWER = `document.body.textContent = JSON.stringify(await gadget.whoami());
+`;
+
 async function gadgetFrom(workspace: Workspace, files: Record<string, string>): Promise<number> {
   let commitId = await workspace.impl.gitStore.writeFilesAsCommit(
       new Map(Object.entries({ "session.js": SESSION, ...files })), {
@@ -130,7 +138,63 @@ async function onTheirConnection<T>(workspace: Workspace, person: Person, gadget
   return await use(connection);
 }
 
-function viewerOf({ profile }: Person, role: "owner" | "use") {
+/** What `person`'s own PDF export of the gadget's UI renders: their real `open()`, `getGadget` and `export`. */
+async function inTheirExport(workspace: Workspace, person: Person, gadgetId: number): Promise<unknown> {
+  using client = await workspace.open(person);
+  using gadget: any = await client.getGadget(gadgetId);
+  return await new Response(await gadget.export("pdf")).json();
+}
+
+class Mailbox {
+  #messages: string[] = [];
+  #takers: ((message: string) => void)[] = [];
+
+  put(message: string): void {
+    let taker = this.#takers.shift();
+    if (taker) taker(message);
+    else this.#messages.push(message);
+  }
+
+  take(): Promise<string> {
+    let message = this.#messages.shift();
+    return message === undefined ? new Promise(resolve => this.#takers.push(resolve)) : Promise.resolve(message);
+  }
+}
+
+/**
+ * The export's browser. Its page opens a Cap'n Web session with the gadget over the page's messages, as the
+ * Workshop's export runtime does, and runs `client` on it in client.js's place: the export is what `client` renders.
+ */
+function browserRendering(client: (gadget: any) => Promise<string>) {
+  let toBrowser = new Mailbox();
+  let toWorker = new Mailbox();
+  let gadget: any;
+  let rendered: Promise<string> | undefined;
+  let closed: (() => void) | undefined;
+  let page = {
+    emulateMediaType: async () => {},
+    setRequestInterception: async () => {},
+    on(event: string, handler: () => void) {
+      if (event === "close") closed = handler;
+    },
+    async goto() {
+      gadget = new RpcSession<any>({
+        send: async message => toWorker.put(message),
+        receive: () => toBrowser.take(),
+      }).getRemoteMain();
+    },
+    async evaluate(fn: unknown, message?: string) {
+      if (fn === sendToBrowser) toBrowser.put(message!);
+      else if (fn === receiveFromBrowser) return await toWorker.take();
+      else if (fn === waitForClientModule) await (rendered = client(gadget));
+    },
+    mainFrame: () => ({ isolatedRealm: () => ({ evaluate: async () => {} }) }),
+    createPDFStream: async () => new Response(await rendered).body,
+  };
+  return { newPage: async () => page, close: async () => closed?.() };
+}
+
+function viewerOf({ profile }: Person, role: "owner" | "build" | "use") {
   return { id: profile.id, name: profile.name, role };
 }
 
@@ -198,6 +262,23 @@ describe("who is viewing a gadget", () => {
         await inDraft(workspace, olive, chatId, board, { from: NAMED_IN_SERVER, to: ASKED_UNDER_ANOTHER_NAME });
         return await connection.whoami();
       }, chatId)).toEqual(viewerOf(olive, "owner"));
+    });
+  });
+
+  it("is a \"Workspace\" colleague at build, on their own connection and in their own export of the gadget's UI",
+      async () => {
+    let olive = await signedIn("Olive Owner");
+    let bea = await signedIn("Bea Workspace");
+    await inWorkspace(olive, async workspace => {
+      workspace.share(bea, "build");
+      let board = await gadgetFrom(workspace, { "server.js": NAMED_IN_SERVER, "client.js": RENDERS_ITS_VIEWER });
+      workspace.impl.env = { ...workspace.impl.env, BROWSER: {} };
+      launch.mockResolvedValue(browserRendering(async gadget => JSON.stringify(await gadget.whoami())));
+
+      expect({
+        connection: await onTheirConnection(workspace, bea, board, connection => connection.whoami()),
+        export: await inTheirExport(workspace, bea, board),
+      }).toEqual({ connection: viewerOf(bea, "build"), export: viewerOf(bea, "build") });
     });
   });
 });
