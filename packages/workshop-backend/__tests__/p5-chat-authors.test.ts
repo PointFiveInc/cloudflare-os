@@ -58,9 +58,12 @@ function steer(impl: Impl, chatId: number, author: AiChatAuthorInfo, text: strin
   impl.storage.chatMeta.put({ ...meta, queuedSteers: [...meta.queuedSteers ?? [], { text, author }] });
 }
 
-/** One agent turn: every model request it made, summary requests included, each led by its system message. */
+/**
+ * One agent turn `asker` started: every model request it made, summary requests included, each led by its system
+ * message.
+ */
 async function turn(impl: Impl, chatId: number, steps: FauxResponseStep[] = [fauxAssistantMessage(fauxText("Done."))],
-    config = MODEL): Promise<Transcript[]> {
+    config = MODEL, asker = ALICE): Promise<Transcript[]> {
   let faux = createFauxCore({ models: [{ id: "faux-model" }] });
   let seen: Transcript[] = [];
   faux.setResponses(steps.map(step => (context, ...rest) => {
@@ -68,7 +71,7 @@ async function turn(impl: Impl, chatId: number, steps: FauxResponseStep[] = [fau
     return typeof step === "function" ? step(context, ...rest) : step;
   }));
   await runAgent(impl, { model: faux.getModel(), stream: faux.stream }, chatId, AGENT, new AbortController().signal,
-      ALICE, config);
+      asker, config);
   expect(faux.getPendingResponseCount()).toBe(0);
   return seen;
 }
@@ -291,8 +294,8 @@ describe("chat authors reach the agent", () => {
     ]);
   }));
 
-  it("an automatic compaction keeps a tail, and who wrote is judged from the messages after the summary point",
-      () => inKernel(async impl => {
+  it("an automatic compaction keeps a tail, and who wrote is judged from the messages after the summary point " +
+      "and the person who started the turn", () => inKernel(async impl => {
     let config: AiModelConfig = { ...MODEL, compactionInputBudget: 2000 };
     let chatId = await chat(impl, [ALICE, "Plan the offsite."]);
     await turn(impl, chatId, [fauxAssistantMessage(fauxText("Planned."))], config);
@@ -300,7 +303,7 @@ describe("chat authors reach the agent", () => {
 
     let [summary, request] = await turn(impl, chatId,
         [fauxAssistantMessage(fauxText("Alice asked for an offsite plan.")), fauxAssistantMessage(fauxText("Booked."))],
-        config);
+        config, BOB);
     expect(isSummaryRequest(summary)).toBe(true);
     expect(said(summary, "user")[0]).toBe(from(ALICE, "Plan the offsite."));
     expect(impl.storage.chatMeta.get(chatId)?.compactedTo).toBeGreaterThan(0);
@@ -314,5 +317,25 @@ describe("chat authors reach the agent", () => {
     expect(isSummaryRequest(summary)).toBe(true);
     expect(said(summary, "user").join("\n")).toContain(from(BOB, "Book the venue."));
     expect(said(request, "user")).toEqual([expect.stringContaining("Bob booked the venue."), "Thanks."]);
+  }));
+
+  it("keeps a second person's steer named, live and on replay, when a compaction inside the turn cut the asker's " +
+      "messages", () => inKernel(async impl => {
+    let config: AiModelConfig = { ...MODEL, compactionInputBudget: 1 };
+    let chatId = await chat(impl, [ALICE, "Approve the refund?"]);
+    let steps = await turn(impl, chatId, [
+      toolStep(() => steer(impl, chatId, BOB, "Yes, approve it.")),
+      fauxAssistantMessage(fauxText("Alice asked about a refund.")),
+      fauxAssistantMessage(fauxText("Approved.")),
+    ], config);
+    expect(steps).toHaveLength(3);
+    expect(isSummaryRequest(steps[1])).toBe(true);
+    let live = shape(steps[2]);
+    expect(live.join("\n")).not.toContain("Approve the refund?");
+    expect(live.at(-1)).toBe(`user: ${from(BOB, "Yes, approve it.")}`);
+    expect(loggedPeople(impl)).toEqual([["Approve the refund?", ALICE.id, false], ["Yes, approve it.", BOB.id, true]]);
+
+    impl.addChatMessages(chatId, ALICE, [{ type: "agentNudge", text: "Retry the previous request." }]);
+    expect(shape(await oneRequest(impl, chatId)).slice(0, live.length)).toEqual(live);
   }));
 });

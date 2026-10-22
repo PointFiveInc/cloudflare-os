@@ -2252,7 +2252,7 @@ async function runAgentPass(
         switch (msg.author.type) {
           case "user":
           case "gadget":
-            content = p5WithAuthor(msg, content, chatMessages);
+            content = p5WithAuthor(msg, content, chatMessages, initiator);
             if (msg.attachments?.length) {
               let parts: (TextContent | ImageContent)[] = [];
               if (content) parts.push({type: "text", text: content});
@@ -4350,7 +4350,7 @@ async function runAgentPass(
     // prompt and tool declarations now ride the leading system message in pi's transcript.
     convertToLlm: (messages) => messages as Message[],
     toolExecution: "sequential",
-    getSteeringMessages: p5SteeringMessages(() => hooks.takeSteers(chatId), chatMessages),
+    getSteeringMessages: p5SteeringMessages(() => hooks.takeSteers(chatId), chatMessages, initiator),
     maxTokens: maxOutputTokens,
     finishTurn: ({message, toolResults}) => {
       if (message.stopReason === "error" || message.stopReason === "aborted") return;

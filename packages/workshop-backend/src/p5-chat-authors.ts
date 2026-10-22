@@ -17,13 +17,15 @@ In a chat where several people write, each person's message starts with a \`<fro
 
 /**
  * `content`, the model's text for a person's message `msg`, starting with a `<from>` line that
- * names its author when `chatMessages` holds messages from two or more people. Any `<from>` tag the
- * person typed is stripped, so nobody can write a line that reads as someone else's. `chatMessages`
- * are the messages the model sees: after a compaction, only those from the summary point on. In a
+ * names its author when two or more people wrote `chatMessages` or started the turn (`initiator`).
+ * Any `<from>` tag the person typed is stripped, so nobody can write a line that reads as someone
+ * else's. `chatMessages` are the messages the model sees: after a compaction, only those from the
+ * summary point on, which can leave out every message of the person who started the turn. In a
  * one-person chat, and for anything a gadget or the agent wrote, `content` comes back unchanged.
  */
-export function p5WithAuthor(msg: Authored, content: string, chatMessages: readonly Authored[]): string {
-  if (msg.author.type !== "user" || !severalPeople(chatMessages)) return content;
+export function p5WithAuthor(msg: Authored, content: string, chatMessages: readonly Authored[],
+    initiator: AiChatAuthorInfo): string {
+  if (msg.author.type !== "user" || !severalPeople(chatMessages, initiator)) return content;
   return `<from>${escapeName(msg.author.name)} (${escapeName(msg.author.id)})</from>\n${content.replace(FROM_TAG, "")}`;
 }
 
@@ -31,23 +33,24 @@ export function p5WithAuthor(msg: Authored, content: string, chatMessages: reado
  * The steering source for one pass of the agent loop: each steer `takeSteers` hands over becomes a
  * user message, labelled as `p5WithAuthor` will label it when the next pass replays it from the log.
  * "Two or more people" is judged from the pass's `chatMessages` plus every steer taken so far, which
- * are the messages that replay reads. A steer sent bare in a one-person chat gains its `<from>` line
- * on replay once a second person writes.
+ * are the messages that replay reads, and the turn's `initiator`. A steer sent bare in a one-person
+ * chat gains its `<from>` line on replay once a second person writes.
  */
 export function p5SteeringMessages(
     takeSteers: () => readonly { text: string; author: AiChatAuthorInfo }[],
-    chatMessages: readonly Authored[]): () => Promise<UserMessage[]> {
+    chatMessages: readonly Authored[], initiator: AiChatAuthorInfo): () => Promise<UserMessage[]> {
   let seen = chatMessages;
   return async () => {
     let steers = takeSteers().map(({ text, author }) => ({ type: "message", author, text }));
     if (steers.length) seen = [...seen, ...steers];
-    return steers.map(steer =>
-      ({ role: "user" as const, content: p5WithAuthor(steer, steer.text, seen), timestamp: Date.now() }));
+    return steers.map(steer => ({
+      role: "user" as const, content: p5WithAuthor(steer, steer.text, seen, initiator), timestamp: Date.now(),
+    }));
   };
 }
 
-function severalPeople(chatMessages: readonly Authored[]): boolean {
-  let first: string | undefined;
+function severalPeople(chatMessages: readonly Authored[], initiator: AiChatAuthorInfo): boolean {
+  let first = initiator.type === "user" ? initiator.id : undefined;
   for (let { type, author } of chatMessages) {
     if (type !== "message" || author.type !== "user") continue;
     first ??= author.id;
