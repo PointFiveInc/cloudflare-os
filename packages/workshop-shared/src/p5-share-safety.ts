@@ -1,11 +1,18 @@
 /**
- * Connections whose gatekeeper refuses every person but the one who connected it, so nobody else can
- * open a workspace that needs one. An entry with no `typeUrlPattern` covers the whole vendor. Each
- * entry is backed by a test of its gatekeeper's own refusal.
+ * Connections whose gatekeeper refuses everyone but the person who connected it, or can shut to
+ * everyone but them for good: a whole Drive or a Drive folder does after one read it can't check
+ * against anyone else, such as an empty search. A workspace that needs one can't be shared. An entry
+ * with no `typeUrlPattern` covers the whole vendor. Each entry is backed by a test of its gatekeeper's
+ * own refusal.
  */
 export const NEVER_SHAREABLE: readonly { vendorId: string; typeUrlPattern?: string; name: string }[] = [
   { vendorId: "google", typeUrlPattern: "https://mail.google.com/*", name: "Gmail" },
   { vendorId: "google", typeUrlPattern: "https://chat.google.com/", name: "a whole Google Chat account" },
+  { vendorId: "google", typeUrlPattern: "https://drive.google.com/drive/my-drive", name: "a whole Google Drive" },
+  {
+    vendorId: "google", typeUrlPattern: "https://drive.google.com/drive/folders/:folderId",
+    name: "a Google Drive folder",
+  },
   { vendorId: "salesforce", name: "Salesforce" },
 ];
 

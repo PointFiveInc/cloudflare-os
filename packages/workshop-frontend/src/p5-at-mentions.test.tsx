@@ -80,12 +80,12 @@ const AGENT_RUNNING = 'Agent is running, wait for it to finish.'
 const CAP = 'This workspace already has 20 people with "Workspace" access, the most it allows; remove one of ' +
   'them in the Share window to make room.'
 const SHARE_REFUSALS = [
-  ['Gmail', "This workspace uses Gmail, which works only for the person who connected it, so they couldn't " +
-    'open it; share a workspace without it instead.'],
-  ['a whole Google Chat account', 'This workspace uses a whole Google Chat account, which works only for the ' +
-    "person who connected it, so they couldn't open it; share a workspace without it instead."],
-  ['Salesforce', "This workspace uses Salesforce, which works only for the person who connected it, so they couldn't " +
-    'open it; share a workspace without it instead.'],
+  ['Gmail', 'This workspace uses Gmail, which can lock out everyone but the person who connected it; share a ' +
+    'workspace without it instead.'],
+  ['a whole Google Chat account', 'This workspace uses a whole Google Chat account, which can lock out everyone ' +
+    'but the person who connected it; share a workspace without it instead.'],
+  ['Salesforce', 'This workspace uses Salesforce, which can lock out everyone but the person who connected it; ' +
+    'share a workspace without it instead.'],
 ]
 const REVIEW: SlashCommandChoice = {
   selection: { gatekeeperId: 42, commandId: 'review' },

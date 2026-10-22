@@ -19,6 +19,14 @@ const DRIVE_ACCOUNT = {
   vendorId: "google", typeUrlPattern: "https://drive.google.com/drive/my-drive",
   resourceUrl: "https://drive.google.com/drive/my-drive",
 };
+const DRIVE_FOLDER = {
+  vendorId: "google", typeUrlPattern: "https://drive.google.com/drive/folders/:folderId",
+  resourceUrl: "https://drive.google.com/drive/folders/1plans",
+};
+const DRIVE_FILE = {
+  vendorId: "google", typeUrlPattern: "https://drive.google.com/file/d/:fileId/view",
+  resourceUrl: "https://drive.google.com/file/d/1brief/view",
+};
 const SHEET = {
   vendorId: "google", typeUrlPattern: "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
   resourceUrl: "https://docs.google.com/spreadsheets/d/1plan/edit",
@@ -55,9 +63,11 @@ function connectionsMade(workspace: Workspace): string[] {
 
 afterEach(() => vi.restoreAllMocks());
 
-describe("a share the granted role could never open", { timeout: 60_000 }, () => {
-  it.each([["Gmail", GMAIL], ["a whole Google Chat account", CHAT_ACCOUNT], ["Salesforce", SALESFORCE]])(
-      "refuses a workspace holding %s at \"Workspace\", in one sentence, and adds nobody", async (name, connection) => {
+describe("a share the granted role could be locked out of", { timeout: 60_000 }, () => {
+  it.each([
+    ["Gmail", GMAIL], ["a whole Google Chat account", CHAT_ACCOUNT], ["a whole Google Drive", DRIVE_ACCOUNT],
+    ["a Google Drive folder", DRIVE_FOLDER], ["Salesforce", SALESFORCE],
+  ])("refuses a workspace holding %s at \"Workspace\", in one sentence, and adds nobody", async (name, connection) => {
     let owner = await signedIn("Izzy Owner");
     let akiva = await signedIn("Akiva Lead");
     await inWorkspace(owner, async workspace => {
@@ -86,11 +96,11 @@ describe("a share the granted role could never open", { timeout: 60_000 }, () =>
     });
   });
 
-  it("passes a Chat conversation, Drive, a Sheet and a wrapper connector at \"Workspace\"", async () => {
+  it("passes a Chat conversation, a Drive file, a Sheet and a wrapper connector at \"Workspace\"", async () => {
     let owner = await signedIn("Izzy Owner");
     let akiva = await signedIn("Akiva Lead");
     await inWorkspace(owner, async workspace => {
-      for (let connection of [CHAT_CONVERSATION, DRIVE_ACCOUNT, SHEET, BRAIN]) workspace.connect(connection);
+      for (let connection of [CHAT_CONVERSATION, DRIVE_FILE, SHEET, BRAIN]) workspace.connect(connection);
       using client = await workspace.open(owner);
       await expect(client.addCollaborator(akiva.profile.id, "build")).resolves.toMatchObject({ role: "build" });
     });
@@ -124,7 +134,7 @@ describe(`the "Workspace" cap of ${WORKSPACE_ROLE_CAP}`, { timeout: 120_000 }, (
   });
 });
 
-describe("a connection that works only for its connector, in a shared workspace", { timeout: 60_000 }, () => {
+describe("a connection that can lock out everyone else, in a shared workspace", { timeout: 60_000 }, () => {
   it("refuses the owner's Gmail while a \"Gadget only\" collaborator can open, and binds nothing", async () => {
     let owner = await signedIn("Izzy Owner");
     let akiva = await signedIn("Akiva Lead");
@@ -154,7 +164,28 @@ describe("a connection that works only for its connector, in a shared workspace"
     });
   });
 
-  it("passes the owner's Gmail while nobody is shared, and a Sheet and a Chat conversation once shared", async () => {
+  it("refuses the owner's whole Drive and Drive folder while a \"Workspace\" collaborator can open, and binds nothing",
+      async () => {
+    let owner = await signedIn("Izzy Owner");
+    let akiva = await signedIn("Akiva Lead");
+    let resolve = resolvesTo(DRIVE_ACCOUNT);
+    await inWorkspace(owner, async workspace => {
+      let made = connectionsMade(workspace);
+      workspace.share(akiva, "build");
+      using client = await workspace.open(owner);
+      expect(await refusal(client.newGatekeeper(3, DRIVE_ACCOUNT.resourceUrl))).toBe("You can't connect a whole " +
+          "Google Drive in a shared workspace, because it can lock out everyone but the person who connects it; " +
+          "connect it in a workspace you haven't shared.");
+      resolve.mockResolvedValue({ class: undefined as never, ...DRIVE_FOLDER });
+      expect(await refusal(client.newGatekeeper(3, DRIVE_FOLDER.resourceUrl)))
+          .toBe(SHARE_SAFETY_REFUSALS.connect("a Google Drive folder"));
+      expect(resolve).toHaveBeenLastCalledWith(3, DRIVE_FOLDER.resourceUrl);
+      expect(made).toEqual([]);
+    });
+  });
+
+  it("passes the owner's Gmail while nobody is shared, and a Sheet, a Chat conversation and a Drive file once shared",
+      async () => {
     let owner = await signedIn("Izzy Owner");
     let akiva = await signedIn("Akiva Lead");
     let resolve = resolvesTo(GMAIL);
@@ -164,11 +195,11 @@ describe("a connection that works only for its connector, in a shared workspace"
       await expect(client.newGatekeeper(3, GMAIL.resourceUrl)).resolves.toBeDefined();
 
       workspace.share(akiva, "build");
-      resolve.mockResolvedValue({ class: undefined as never, ...SHEET });
-      await expect(client.newGatekeeper(3, SHEET.resourceUrl)).resolves.toBeDefined();
-      resolve.mockResolvedValue({ class: undefined as never, ...CHAT_CONVERSATION });
-      await expect(client.newGatekeeper(3, CHAT_CONVERSATION.resourceUrl)).resolves.toBeDefined();
-      expect(made).toEqual(["google", "google", "google"]);
+      for (let connection of [SHEET, CHAT_CONVERSATION, DRIVE_FILE]) {
+        resolve.mockResolvedValue({ class: undefined as never, ...connection });
+        await expect(client.newGatekeeper(3, connection.resourceUrl)).resolves.toBeDefined();
+      }
+      expect(made).toEqual(["google", "google", "google", "google"]);
     });
   });
 });

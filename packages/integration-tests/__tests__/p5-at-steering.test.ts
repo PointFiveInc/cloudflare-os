@@ -63,8 +63,8 @@ const OWNER = "Izzy Owner";
 const COLLEAGUE = "Dana Colleague";
 const NEWCOMER = "Akiva Newcomer";
 const AGENT_RUNNING = "Agent is running, wait for it to finish.";
-const shareRefused = (name: string) => `This workspace uses ${name}, which works only for the person who ` +
-    "connected it, so they couldn't open it; share a workspace without it instead.";
+const shareRefused = (name: string) => `This workspace uses ${name}, which can lock out everyone but the person ` +
+    "who connected it; share a workspace without it instead.";
 const CAP_REFUSED = `This workspace already has ${WORKSPACE_ROLE_CAP} people with "Workspace" access, the most ` +
     "it allows; remove one of them in the Share window to make room.";
 

@@ -5,10 +5,10 @@ import type { OverseerStorage } from "./storage-schema/overseer-storage";
 
 /** Each refusal in one sentence: the share and the cap to the owner, the connect to whoever connects. */
 export const SHARE_SAFETY_REFUSALS = {
-  share: (name: string) => `This workspace uses ${name}, which works only for the person who connected it, so ` +
-      "they couldn't open it; share a workspace without it instead.",
-  connect: (name: string) => `You can't connect ${name} in a shared workspace, because it works only for the ` +
-      "person who connects it; connect it in a workspace you haven't shared.",
+  share: (name: string) => `This workspace uses ${name}, which can lock out everyone but the person who ` +
+      "connected it; share a workspace without it instead.",
+  connect: (name: string) => `You can't connect ${name} in a shared workspace, because it can lock out everyone ` +
+      "but the person who connects it; connect it in a workspace you haven't shared.",
   cap: `This workspace already has ${WORKSPACE_ROLE_CAP} people with "Workspace" access, the most it allows; ` +
       "remove one of them in the Share window to make room.",
 };
@@ -21,8 +21,8 @@ export interface ShareSafetyHost {
 }
 
 /**
- * Refuses a share the granted role could never open: a connection that role is verified against
- * refuses everyone but its connector. Then refuses a "Workspace" share one past the cap, counting the
+ * Refuses a share the granted role could be locked out of: a connection that role is verified against
+ * can lock out everyone but its connector. Then refuses a "Workspace" share one past the cap, counting the
  * other people listed at "Workspace", so re-adding someone already in passes.
  */
 export async function refuseUnsafeShare(
@@ -40,7 +40,7 @@ export async function refuseUnsafeShare(
 
 /**
  * Refuses connecting one of those connections while anyone else can open the workspace, at either
- * role: it would lock them out, or run a collaborator's own account for everyone there.
+ * role: it could lock them out, or run a collaborator's own account for everyone there.
  */
 export async function refuseUnsafeConnect(
     host: ShareSafetyHost, vendorId: string, typeUrlPattern: string): Promise<void> {
