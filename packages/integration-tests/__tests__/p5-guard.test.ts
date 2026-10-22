@@ -192,6 +192,30 @@ function declarations(body: Source, name: string): string[] {
     .map(([declaration]) => declaration.replace(/\s+/g, " ").trim());
 }
 
+/**
+ * The `type` tag of each object in the union type alias `name` declared in `source`, in order, read
+ * up to the alias's closing `;`. Tags of objects nested inside a member are not read.
+ */
+function unionTypeTags(source: Source, name: string): string[] {
+  const header = new RegExp(`^(?:export\\s+)?type\\s+${name}\\s*=`, "m").exec(source.masked);
+  if (header === null) return [];
+  const tag = /type\s*:\s*"(\w+)"/y;
+  const tags: string[] = [];
+  let depth = 0;
+  for (let at = header.index + header[0].length; at < source.masked.length; at++) {
+    const char = source.masked[at]!;
+    if (char === "{") depth++;
+    else if (char === "}") depth--;
+    else if (char === ";" && depth === 0) break;
+    else if (char === "t" && depth === 1 && !/[\w$]/.test(source.masked[at - 1]!)) {
+      tag.lastIndex = at;
+      const found = tag.exec(source.code);
+      if (found !== null) tags.push(found[1]!);
+    }
+  }
+  return tags;
+}
+
 function sourceAt(sources: Source[], path: string): Source {
   const source = sources.find(entry => entry.path === path);
   if (source === undefined) throw new Error(`${path} is not among Cloudflare's sources`);
@@ -213,6 +237,15 @@ const CHAT_ENTRY_POINTS = {
       "Promise<void>;",
   ],
 };
+
+/**
+ * The kinds of record in a chat's log, as Cloudflare's `AiChatMessageBody` declares them. Only a
+ * `message` carries a person's typed words to the model, and replay gives it its author's line.
+ */
+const CHAT_RECORD_TYPES = [
+  "message", "slashCommand", "changes", "merge", "revert", "action", "useGadget", "catalogChange", "error",
+  "agentCallback", "agentNudge", "connectionRequest",
+];
 
 function chatEntryPoints(): typeof CHAT_ENTRY_POINTS {
   const overseer = typeBody(sourceAt(cloudflareSources(SHARED), `${SHARED}/api.ts`), "Overseer");
@@ -305,6 +338,27 @@ describe("the source walker", () => {
     expect(declarations(typeBody(source, "Shape"), "target"))
       .toEqual(["target( first: string | null, second?: number[]): Promise<void>;"]);
     expect(declarations(typeBody(source, "Shape"), "missing")).toEqual([]);
+  });
+
+  it("reads the type tag of each object in a union type alias, past nested objects, strings and comments", () => {
+    const source = {
+      path: "example.ts",
+      ...lex([
+        "type Before = { type: \"before\" };",
+        "export type Body = {",
+        "  /** type: \"comment\" */",
+        "  type: \"first\";",
+        "  nested: { type: \"nested\"; label: \"};\" };",
+        "} | {",
+        "  type: \"second\",",
+        "  subtype: \"third\";",
+        "} | Named;",
+        "type After = { type: \"after\" };",
+      ].join("\n")),
+    };
+
+    expect(unionTypeTags(source, "Body")).toEqual(["first", "second"]);
+    expect(unionTypeTags(source, "Bod")).toEqual([]);
   });
 });
 
@@ -406,6 +460,29 @@ describe("Cloudflare code PointFive's changes lean on", () => {
   it("the chat entry points: the Overseer declares newChat and sendChatMessage once each, as the hooks expect",
       () => {
     expect(chatEntryPoints(), "a changed or added chat entry point can carry a person's message past the hooks " +
-      "in the client's newChat and sendChatMessage: re-check every p5- hook there").toEqual(CHAT_ENTRY_POINTS);
+      "in the client's newChat and sendChatMessage, or to the model without its author's <from> line: re-check " +
+      "every p5- hook there, and p5-chat-authors.ts's hooks in agent.ts").toEqual(CHAT_ENTRY_POINTS);
+  });
+
+  it("authors: one steering source, in agent.ts, no follow-up source, and the chat log's twelve kinds of record",
+      () => {
+    const backend = cloudflareSources(BACKEND);
+    const found = {
+      steeringSources: occurrences(backend, "getSteeringMessages"),
+      steeringSourcesInAgent: occurrences([sourceAt(backend, `${BACKEND}/agent.ts`)], "getSteeringMessages"),
+      followUpSources: occurrences(backend, "getFollowUpMessages"),
+    };
+
+    expect(Object.fromEntries(Object.entries(found).map(([pin, places]) => [pin, places.length])),
+      "a second way for a person's words to reach the model during a turn skips p5-chat-authors.ts, so they " +
+      "reach it with no <from> line: re-check its hooks at agent.ts's replay and steering source. " +
+      `Found: ${JSON.stringify(found, null, 2)}`).toEqual({
+      steeringSources: 1,
+      steeringSourcesInAgent: 1,
+      followUpSources: 0,
+    });
+    expect(unionTypeTags(sourceAt(cloudflareSources(SHARED), `${SHARED}/api.ts`), "AiChatMessageBody"),
+      "a new or renamed kind of chat record can carry a person's words to the model past replay's labelled " +
+      "message: re-check p5-chat-authors.ts's hook in agent.ts's replay").toEqual(CHAT_RECORD_TYPES);
   });
 });

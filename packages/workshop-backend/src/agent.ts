@@ -25,6 +25,7 @@ import {
   seenAlwaysAvailableResources,
 } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
+import { P5_CHAT_AUTHORS_GUIDANCE, p5SteeringMessages, p5WithAuthor } from "./p5-chat-authors";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
@@ -325,7 +326,7 @@ export interface AgentHooks {
    * Takes the messages sent to the chat since the agent last asked, recording each in the chat
    * log as a steered message. The agent reads them before its next model request.
    */
-  takeSteers(chatId: number): string[];
+  takeSteers(chatId: number): {text: string, author: AiChatAuthorInfo}[];
 
   /**
    * The step's persistence barrier: in one storage transaction, persist the step's chat
@@ -2249,6 +2250,7 @@ async function runAgentPass(
         switch (msg.author.type) {
           case "user":
           case "gadget":
+            content = p5WithAuthor(msg, content, chatMessages);
             if (msg.attachments?.length) {
               let parts: (TextContent | ImageContent)[] = [];
               if (content) parts.push({type: "text", text: content});
@@ -3203,6 +3205,7 @@ async function runAgentPass(
 
   // Shared guidance precedes deployment instructions for both agent types.
   systemPromptSlots[0] += `\n\n${COMMUNICATION_GUIDANCE}`;
+  systemPromptSlots[0] += `\n\n${P5_CHAT_AUTHORS_GUIDANCE}`;
   if (instanceInstructions) {
     systemPromptSlots[0] += `\n\n${instanceInstructions}`;
   }
@@ -4344,8 +4347,7 @@ async function runAgentPass(
     // prompt and tool declarations now ride the leading system message in pi's transcript.
     convertToLlm: (messages) => messages as Message[],
     toolExecution: "sequential",
-    getSteeringMessages: async () => hooks.takeSteers(chatId).map(
-        text => ({role: "user" as const, content: text, timestamp: Date.now()})),
+    getSteeringMessages: p5SteeringMessages(() => hooks.takeSteers(chatId), chatMessages),
     maxTokens: maxOutputTokens,
     finishTurn: ({message, toolResults}) => {
       if (message.stopReason === "error" || message.stopReason === "aborted") return;

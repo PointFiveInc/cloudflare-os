@@ -7063,7 +7063,7 @@ class OverseerImpl implements AgentHooks {
 
   // AgentHooks.takeSteers: logs each queued steer at the step boundary where the agent reads it,
   // so the log keeps the order the model saw.
-  takeSteers(chatId: number): string[] {
+  takeSteers(chatId: number): NonNullable<StoredChatMetadata["queuedSteers"]> {
     let meta = this.storage.chatMeta.get(chatId);
     return meta?.queuedSteers ? this.#logQueuedSteers(meta, true) : [];
   }
@@ -7071,7 +7071,7 @@ class OverseerImpl implements AgentHooks {
   // Moves the chat's queued steers into its log as user messages, `steered` unless they prompt a
   // turn, then writes `meta` without them. Subscribers thus get the messages before the metadata,
   // as subscribeToChat's catch-up delivers them.
-  #logQueuedSteers(meta: StoredChatMetadata, steered: boolean): string[] {
+  #logQueuedSteers(meta: StoredChatMetadata, steered: boolean): NonNullable<StoredChatMetadata["queuedSteers"]> {
     let steers = (meta.queuedSteers ?? []).map(({text, author}) => {
       this.storage.chats.put({
         chatId: meta.id,
@@ -7082,7 +7082,7 @@ class OverseerImpl implements AgentHooks {
         message: text,
         ...(steered ? {steered: true} : {}),
       });
-      return text;
+      return {text, author};
     });
     delete meta.queuedSteers;
     meta.lastActive = this.getChatTimestamp();
