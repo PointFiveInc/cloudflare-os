@@ -56,6 +56,8 @@ import ChatInterface, {
 import { formatOf } from './components/format/formats'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import ShareModal from './ShareModal'
+import { p5OffersShare } from './p5-owner-only'
+import { p5CapturedLogCount, p5OffersCode, p5PaneTabs, p5ShownTab, useP5SimpleLook } from './p5-simple-look'
 import { GadgetPresence } from './components/GadgetPresence'
 import BlueprintModal from './BlueprintModal'
 import { UpdateFromBlueprintDialog } from './features/blueprint-updates/UpdateFromBlueprintDialog'
@@ -467,6 +469,7 @@ export default function GadgetEditor() {
   const id = params.id
   const navigate = useNavigate()
   const { authenticatedApi } = useAuthenticatedApi()
+  const p5SimpleLook = useP5SimpleLook()
   const publicApi = useRpcStub()
 
   const { chat: chatParam, w: workpieceParam, showChat: showChatParam } =
@@ -789,7 +792,7 @@ export default function GadgetEditor() {
   const blueprintUpdateAvailable =
     useBlueprintUpdateAvailable(publicApi, selectedGadgetSummary?.upstream)
   // A worktree has only Code; the chosen tab is remembered for the next gadget.
-  const activeTab: RightTab = selectedWorkpieceSummary?.type === 'worktree' ? 'code' : chosenTab
+  const activeTab: RightTab = selectedWorkpieceSummary?.type === 'worktree' ? 'code' : p5ShownTab(chosenTab, p5SimpleLook)
 
   // Lazily normalize legacy "open" preferences once the accepted app list is known. Draft apps
   // remain session-only until accepted; at that point this effect persists them automatically.
@@ -1651,6 +1654,7 @@ export default function GadgetEditor() {
 
           {showReconnecting && <ReconnectingChip />}
 
+          {p5OffersShare(metadata) && (
           <WorkshopIconButton
             onClick={() => setShareModalOpen(true)}
             title="Share workspace"
@@ -1658,6 +1662,7 @@ export default function GadgetEditor() {
           >
             <ShareNetwork size={15} />
           </WorkshopIconButton>
+          )}
 
           <DropdownMenu>
             <DropdownMenu.Trigger
@@ -1777,7 +1782,7 @@ export default function GadgetEditor() {
             }
           />
           <DropdownMenu.Content className={MENU_CONTENT} style={MENU_POSITIONER_STYLE}>
-            {mobilePrimaryTab !== 'code' && (
+            {mobilePrimaryTab !== 'code' && p5OffersCode(selectedWorkpieceSummary, p5SimpleLook) && (
               <DropdownMenu.Item
                 disabled={selectedWorkpieceSummary === undefined}
                 onClick={() => openMobilePane('code')}
@@ -1813,9 +1818,11 @@ export default function GadgetEditor() {
             <DropdownMenu.Item onClick={() => setIsEditingTitle(true)} className={MENU_ITEM}>
               Rename workspace
             </DropdownMenu.Item>
+            {p5OffersShare(metadata) && (
             <DropdownMenu.Item onClick={() => setShareModalOpen(true)} className={MENU_ITEM}>
               Share workspace
             </DropdownMenu.Item>
+            )}
             {workspaceMute && workspaceMute.workspaceId === id && (
               <WorkspaceNotificationsMenu
                 workspaceId={workspaceMute.workspaceId}
@@ -1907,7 +1914,7 @@ export default function GadgetEditor() {
                   onLiveEditPreviewsChange={setLiveEditPreviews}
                   chatContent={chatContent}
                   onStreamingActiveFileChange={handleStreamingActiveFileChange}
-                  pendingConsoleLogCount={consoleLogCount}
+                  pendingConsoleLogCount={p5CapturedLogCount(consoleLogCount, p5SimpleLook)}
                   consoleLogPreview={
                     consoleLogCount > 0 ? formatConsoleLogs(consoleLogBufferRef.current) : ''
                   }
@@ -2003,7 +2010,7 @@ export default function GadgetEditor() {
                       onClick={() => setActivityView(tab.value)}
                     />
                   ))
-                  : rightTabs(selectedWorkpieceSummary).map(tab => (
+                  : p5PaneTabs(rightTabs(selectedWorkpieceSummary), selectedWorkpieceSummary, p5SimpleLook).map(tab => (
                     <PaneTab
                       key={tab.value}
                       active={activeTab === tab.value}

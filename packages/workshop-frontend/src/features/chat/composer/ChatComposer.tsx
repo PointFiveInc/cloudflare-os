@@ -62,6 +62,7 @@ import {
 import { useComposerResources } from "./useComposerResources";
 import { useComposerEditorLayout } from "./useComposerEditorLayout";
 import styles from "./ChatComposer.module.css";
+import { useP5AtMentions } from "../../../p5-at-mentions";
 
 // A capsule's text begins with an em space, which reserves the box the mirror paints the vendor
 // logo into, and a no-break space, which is the gap between the logo and the title. The word
@@ -478,6 +479,7 @@ export const ChatComposer = ({
     onSelect: applySlashCommandSelection,
     chatExists: !newChat,
   });
+  const atMentions = useP5AtMentions({ document: composerDocument, cursorPosition, noAgent: selectedModel == null, isAgentActive, getOverseer, anchorRef: promptCardRef, textareaRef: composerTextareaRef, editText: (text, caret) => handleInputChange(text, caret), moveCaret, disabled: isBlocked || slashCommandPicker.open });
 
   connectionCreatedRef.current = () => {
     slashCommandPicker.invalidateCatalog();
@@ -523,6 +525,7 @@ export const ChatComposer = ({
       const { message, capsules: capsuleSpecifiers, formats: formatRefs } =
         submissionResult.submission;
 
+      if (!(await atMentions.beforeSend(message))) return;
       await onSend(message, selectedModel?.id ?? null,
           capsuleSpecifiers,
           readyAttachments.length ? readyAttachments : undefined,
@@ -750,6 +753,7 @@ export const ChatComposer = ({
           </div>
         )}
         {draftUpdateBanner}
+        {atMentions.ui}
         {sendHiccup && sendHiccup.chatKey === chatKey && (
           <div className="px-4 pt-2 text-xs text-kumo-warning">
             {/* Composers without a chatKey (new-chat, home page) have no thread to check. */}
@@ -865,6 +869,7 @@ export const ChatComposer = ({
                 // is not the only key it owns -- Escape cancels a composition and the arrows move
                 // through candidates.
                 if (isImeComposing(e)) return;
+                if (atMentions.onKeyDown(e)) return;
                 if (slashCommandPicker.open && e.key === "Escape") {
                   e.preventDefault();
                   slashCommandPicker.dismiss();

@@ -6,6 +6,8 @@ import { useState, useEffect, useRef } from 'react'
 import type { GadgetMetadataWithTimestamps, NotificationMute } from '@gadgets/workshop-shared/api'
 import { WorkspaceNotificationsMenu } from '../../features/notifications/WorkspaceNotificationsMenu'
 import { describeMute } from '../../features/notifications/notificationMute'
+import { useP5Mark } from '../../p5-marks'
+import { p5OffersShare } from '../../p5-owner-only'
 import { isImeComposing } from '../../keyboardEvent'
 
 function initials(title: string | undefined): string {
@@ -37,6 +39,7 @@ export default function SidebarGadgetRow({
   onNotificationMuteChange: (g: GadgetMetadataWithTimestamps, mute: NotificationMute | undefined) => void
   onDelete: (g: GadgetMetadataWithTimestamps) => void
 }) {
+  const p5Mark = useP5Mark(gadget, 'compact')
   const [renaming, setRenaming] = useState(false)
   const [renameValue, setRenameValue] = useState(gadget.title || '')
   const inputRef = useRef<HTMLInputElement>(null)
@@ -67,6 +70,7 @@ export default function SidebarGadgetRow({
       onClick={(e) => {
         if (renaming) e.preventDefault()
       }}
+      search={p5Mark.search}
       title={collapsed ? gadget.title || 'Untitled workspace' : undefined}
     >
       <div
@@ -98,6 +102,7 @@ export default function SidebarGadgetRow({
           {muteDescription && (
             <BellSlash size={12} alt={muteDescription} className="shrink-0 text-kumo-inactive" />
           )}
+          {p5Mark.label}
 
           {/* Inside the row's <Link>: stopPropagation blocks the Link's SPA handler, so preventDefault
               is needed to stop the native <a> from navigating. */}
@@ -128,12 +133,14 @@ export default function SidebarGadgetRow({
                   <Star size={13} className="mr-2" weight={gadget.pinned ? 'fill' : 'regular'} />
                   {gadget.pinned ? 'Unfavorite' : 'Favorite'}
                 </DropdownMenu.Item>
+                {p5OffersShare(gadget) && (
                 <DropdownMenu.Item
                   onClick={() => onShare(gadget)}
                   className={MENU_ITEM}
                 >
                   <ShareNetwork size={13} className="mr-2" /> Share
                 </DropdownMenu.Item>
+                )}
                 <WorkspaceNotificationsMenu
                   workspaceId={gadget.id}
                   mute={gadget.notificationMute}

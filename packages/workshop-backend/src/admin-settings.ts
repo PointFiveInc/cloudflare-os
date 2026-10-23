@@ -19,6 +19,7 @@ import { UserDurableObject } from './user.js';
 import { bundledBlueprintsManifestVersion, installBundledBlueprints } from './bundled-blueprints.js';
 import { BUNDLED_BLUEPRINTS } from './generated/bundled-blueprints.js';
 import { type DeployServiceInstall, NO_ANSWER, type VersionAnswer, deployServiceInstall, deploymentUpdateStatus, fetchLatestRelease, updateCheckDue } from './deployment-updates.js';
+import { p5ApplyToggles, type P5ToggleChange, type P5Toggles } from './p5-admin-toggles.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -1052,6 +1053,8 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   getSettings(): Promise<AdminSettingsView> {
     return this.admin.getSettings(this.adminUserId);
   }
+
+  p5Toggles(change?: P5ToggleChange): Promise<P5Toggles> { return p5ApplyToggles(this.admin, change); }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {
     await this.admin.updateAdminConfig({ signupsEnabled: enabled });

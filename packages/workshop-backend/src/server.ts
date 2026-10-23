@@ -33,6 +33,7 @@ import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { deployServiceInstall, routerVersionTag } from "./deployment-updates.js";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
+import { p5ClearMark } from "./p5-marks.js";
 import { deviceSessionCallback } from "./auth/device-session-callback.js";
 
 const logger = createWorkshopLogger("workshop.server");
@@ -335,6 +336,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       throw err;
     }
     started = true;
+    await p5ClearMark(this.#user, id);
     return result;
   }
 

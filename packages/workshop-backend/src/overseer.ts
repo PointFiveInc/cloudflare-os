@@ -79,6 +79,13 @@ import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker"
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
+import { p5OwnerOnly } from "./p5-owner-only";
+import { refuseUnsafeConnect, refuseUnsafeShare } from "./p5-share-safety";
+import { p5ForgetSharedListings, p5LeaveMentionMarks, p5LeaveShareMark } from "./p5-marks";
+import { p5AtMention } from "./p5-at-mentions";
+import { p5ConnectGadgetViewer } from "./p5-viewer-call";
+import { P5PeopleWithAccess, p5AddPeopleWithAccess, type P5PeopleWithAccessTarget } from "./p5-people-with-access";
+import { p5InstanceInstructions, p5TurnEndAccept } from "./p5-turn-end-accept";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
@@ -1139,6 +1146,7 @@ class OverseerImpl implements AgentHooks {
       this.#unregisterRunningAgent(record.chatId, !!wait);
       this.#publishAgentTurnNotification(record.chatId, record.initiator, record.initiatorUserId);
       this.#finishAgentTurn(record.chatId);
+      p5TurnEndAccept(this, record.chatId, record.initiatorUserId);
       return;
     }
     if ((record.resumeAttempts ?? 0) >= AGENT_RESUME_MAX_ATTEMPTS) {
@@ -2640,6 +2648,7 @@ class OverseerImpl implements AgentHooks {
     // shadows it (see bindWorkpiece). The agent's describeBinding tool mirrors this order when
     // describing a gadget's bindings (see describeBinding in agent.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
+    p5AddPeopleWithAccess(env, this, caller);
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
     }
@@ -4760,7 +4769,9 @@ class OverseerImpl implements AgentHooks {
         return (...args: any[]) => {
           let result: Promise<any>;
           if (viewer) {
-            let pending = viewerSession ??= connectGadgetViewer(target, viewer).catch(err => {
+            let pending = viewerSession ??= p5ConnectGadgetViewer(target, viewer, connectGadgetViewer,
+                () => self.readGadgetFiles(gadgetId,
+                    self.#resolveGadgetChatId(gadgetId, self.#runningChatIds.get(gadgetId) ?? undefined))).catch(err => {
               viewerSession = undefined;
               throw err;
             });
@@ -5358,6 +5369,7 @@ class OverseerImpl implements AgentHooks {
       case "git":
         return Promise.resolve(new GitImpl(this, () => this.#gitAuthorFor(caller)));
 
+      case "p5PeopleWithAccess": return Promise.resolve(new P5PeopleWithAccess(this));
       default:
         target satisfies never;
         throw new TypeError("Unknown binding target type.");
@@ -7113,7 +7125,7 @@ class OverseerImpl implements AgentHooks {
 
   // AgentHooks.takeSteers: logs each queued steer at the step boundary where the agent reads it,
   // so the log keeps the order the model saw.
-  takeSteers(chatId: number): string[] {
+  takeSteers(chatId: number): NonNullable<StoredChatMetadata["queuedSteers"]> {
     let meta = this.storage.chatMeta.get(chatId);
     return meta?.queuedSteers ? this.#logQueuedSteers(meta, true) : [];
   }
@@ -7121,7 +7133,7 @@ class OverseerImpl implements AgentHooks {
   // Moves the chat's queued steers into its log as user messages, `steered` unless they prompt a
   // turn, then writes `meta` without them. Subscribers thus get the messages before the metadata,
   // as subscribeToChat's catch-up delivers them.
-  #logQueuedSteers(meta: StoredChatMetadata, steered: boolean): string[] {
+  #logQueuedSteers(meta: StoredChatMetadata, steered: boolean): NonNullable<StoredChatMetadata["queuedSteers"]> {
     let steers = (meta.queuedSteers ?? []).map(({text, author}) => {
       this.storage.chats.put({
         chatId: meta.id,
@@ -7132,7 +7144,7 @@ class OverseerImpl implements AgentHooks {
         message: text,
         ...(steered ? {steered: true} : {}),
       });
-      return text;
+      return {text, author};
     });
     delete meta.queuedSteers;
     meta.lastActive = this.getChatTimestamp();
@@ -7593,6 +7605,7 @@ class OverseerImpl implements AgentHooks {
           // A failed turn logged its unread steers before its error (see postAgentErrorMessage),
           // so it starts no follow-up, which would likely fail the same way.
           this.#finishAgentTurn(chatId, {aiModel, initiator, initiatorUserId});
+          if (finished && !liveChat.cancelController.signal.aborted) p5TurnEndAccept(this, chatId, initiatorUserId);
         }
       }
     }
@@ -9411,7 +9424,7 @@ class OverseerImpl implements AgentHooks {
   async getInstanceInstructions(): Promise<string> {
     try {
       // Cheap single KV get from the mirror AdminSettings maintains; avoids the singleton DO.
-      return (await readAdminConfig(this.env)).instanceInstructions;
+      return p5InstanceInstructions(await readAdminConfig(this.env));
     } catch (err) {
       this.logger.warn("failed to read instance instructions", {
         event: "instance.instructions.read.failed", error: err,
@@ -10321,6 +10334,7 @@ class OverseerImpl implements AgentHooks {
       this.#sharingManager = new SharingManager(
           this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get());
     }
+    p5OwnerOnly(this, this.#sharingManager);
     return this.#sharingManager;
   }
 
@@ -10571,6 +10585,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       this.impl.markOutputsDirty();
     }
 
+    await this.impl.getSharingManager();
     // The caller's effective role. The owner always has "build".
     let role: CollaboratorRole = "build";
 
@@ -10981,7 +10996,7 @@ type BindingLoopbackTarget = {
   // A gadget binding's `exports` in the agent's executeCode env (see exports-session.ts).
   type: "exports";
   id: WorkpieceId;
-};
+} | P5PeopleWithAccessTarget;
 
 /**
  * Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
@@ -11535,6 +11550,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         await this.disableHook(record.id);
       }
     }
+    await p5ForgetSharedListings(this.impl);
 
     await this.impl.ctx.blockConcurrencyWhile(async () => {
       await this.#owner.deleteGadget(this.impl.ctx.id.toString());
@@ -11625,6 +11641,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       : Promise<GatekeeperClient<any> | null> {
     let {class: cls, vendorId, typeUrlPattern} =
         await this.#clientUser.getGatekeeperClassFor(accountId, resourceUrl);
+    await refuseUnsafeConnect(this.impl, vendorId, typeUrlPattern);
     let creationSpec: GatekeeperCreationSpec = {
       type: "gatekeeper",
       vendorId,
@@ -12310,10 +12327,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
                 formats?: MessageFormatRef[]): Promise<number> {
+    let mentioned = await p5AtMention(this.impl, await this.#getClientProfile(), initialMessage);
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
-    return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
+        () => this.#clientUser.getChatContext(mentioned.length ? null : chosenModelId), this.impl.logger);
+    let chatId = await this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
                              undefined, undefined, formats);
+    if (mentioned.owner) {
+      await p5LeaveMentionMarks(this.impl, chatId, false, userMeta.profile, mentioned, mentioned.owner);
+    }
+    return chatId;
   }
 
   async sendChatMessage(
@@ -12323,14 +12345,18 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // A steer runs on the running turn's model, so it is queued before the sender's model is
     // looked up: a collaborator need not have that model.
     let author = await this.#getClientProfile();
-    if (this.impl.steerRunningTurn(
+    let mentioned = await p5AtMention(this.impl, author, message);
+    if (!mentioned.length && this.impl.steerRunningTurn(
         chatId, this.clientUserId, author, message, capsules, attachments, formats)) {
       return;
     }
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
-    return this.impl.sendChatMessage(
+        () => this.#clientUser.getChatContext(mentioned.length ? null : chosenModelId), this.impl.logger);
+    await this.impl.sendChatMessage(
         this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
+    if (mentioned.owner) {
+      await p5LeaveMentionMarks(this.impl, chatId, true, author, mentioned, mentioned.owner);
+    }
   }
 
   async setChatTitle(chatId: number, title: string): Promise<void> {
@@ -12629,13 +12655,16 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!profile) {
       return null;
     }
+    await refuseUnsafeShare(this.impl, profile, role);
 
-    return (await this.impl.getSharingManager()).addCollaborator({
+    let added = (await this.impl.getSharingManager()).addCollaborator({
       caller: this.#sharingCaller(),
       profile,
       role,
       note,
     });
+    await p5LeaveShareMark(this.impl, userDo, added.role ?? role, this.#getClientProfile());
+    return added;
   }
 
   async previewRemoveCollaborator(profileId: string): Promise<AffectedCollaborator[]> {

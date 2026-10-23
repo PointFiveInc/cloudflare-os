@@ -25,6 +25,8 @@ import {
   seenAlwaysAvailableResources,
 } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
+import { P5_CHAT_AUTHORS_GUIDANCE, p5SteeringMessages, p5WithAuthor } from "./p5-chat-authors";
+import { P5_PEOPLE_WITH_ACCESS_GUIDANCE, p5DescribePeopleWithAccess } from "./p5-people-with-access";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
@@ -264,6 +266,7 @@ async function describeBinding(
   let edge = info.bindings.find(binding => binding.name === name);
   if (edge) return hooks.describeBinding(envName, edge.target, chatId);
   if (name === GIT_BINDING_NAME) return hooks.describeGitBinding(envName);
+  if (name === "PEOPLE_WITH_ACCESS") return p5DescribePeopleWithAccess(envName);
   if (name === "GADGET") {
     // Unlike the gadget bindings in the agent's env, a gadget's env.GADGET is
     // the bare RPC stub.
@@ -326,7 +329,7 @@ export interface AgentHooks {
    * Takes the messages sent to the chat since the agent last asked, recording each in the chat
    * log as a steered message. The agent reads them before its next model request.
    */
-  takeSteers(chatId: number): string[];
+  takeSteers(chatId: number): {text: string, author: AiChatAuthorInfo}[];
 
   /**
    * The step's persistence barrier: in one storage transaction, persist the step's chat
@@ -2265,6 +2268,7 @@ async function runAgentPass(
         switch (msg.author.type) {
           case "user":
           case "gadget":
+            content = p5WithAuthor(msg, content, chatMessages, initiator);
             if (msg.attachments?.length) {
               let parts: (TextContent | ImageContent)[] = [];
               if (content) parts.push({type: "text", text: content});
@@ -3215,10 +3219,12 @@ async function runAgentPass(
           `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
+    systemPromptSlots[0] += `\n\n${P5_PEOPLE_WITH_ACCESS_GUIDANCE}`;
   }
 
   // Shared guidance precedes deployment instructions for both agent types.
   systemPromptSlots[0] += `\n\n${COMMUNICATION_GUIDANCE}`;
+  systemPromptSlots[0] += `\n\n${P5_CHAT_AUTHORS_GUIDANCE}`;
   if (instanceInstructions) {
     systemPromptSlots[0] += `\n\n${instanceInstructions}`;
   }
@@ -4365,8 +4371,7 @@ async function runAgentPass(
     // prompt and tool declarations now ride the leading system message in pi's transcript.
     convertToLlm: (messages) => messages as Message[],
     toolExecution: "sequential",
-    getSteeringMessages: async () => hooks.takeSteers(chatId).map(
-        text => ({role: "user" as const, content: text, timestamp: Date.now()})),
+    getSteeringMessages: p5SteeringMessages(() => hooks.takeSteers(chatId), chatMessages, initiator),
     maxTokens: maxOutputTokens,
     finishTurn: ({message, toolResults}) => {
       if (message.stopReason === "error" || message.stopReason === "aborted") return;

@@ -11,6 +11,7 @@ import type {
 } from "@gadgets/workshop-shared/api";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import type { DeviceSessionHandoff } from "../auth/device-session-handoff.js";
+import type { P5Marked } from "@gadgets/workshop-shared/p5-marks";
 
 export type ConnectedAccountRecord = {
   id: number;
@@ -113,7 +114,7 @@ type LibraryBlueprintRecord = {
   uploaded: boolean;
 };
 
-export type GadgetRecord = GadgetMetadata & {
+export type GadgetRecord = GadgetMetadata & P5Marked & {
   created: Date;
   lastActive?: Date;  // if missing, gadget is provisional
   // If we're not the gadget owner (it was shared with us), `owner` is set (inherited from

@@ -19,6 +19,7 @@ import { ContextApiImpl } from "./context-api.js";
 import { contextObserverStrategy } from "./context-observers.js";
 import type { ContextVerifierApi } from "./context-observers.js";
 import { canReadCollection } from "./collection-access.js";
+import { p5ColleaguesSeeSkills, p5ContextMaxObservers } from "./p5-colleagues.js";
 import {
   buildAgentSkillCommands, buildAgentSkillMessage, buildContextCatalog, parseSkillManifest,
   type CollectionSkills,
@@ -212,6 +213,7 @@ export class ContextVerifier
     extends WorkerEntrypoint<Cloudflare.Env, ContextAccountProps>
     implements ContextVerifierApi {
   async hasCollectionsAccess(sharingDomain: string, collectionIds: string[]): Promise<boolean[]> {
+    if (p5ColleaguesSeeSkills(this.env) && sharingDomain === this.ctx.props.sharingDomain) return collectionIds.map(() => true);
     if (sharingDomain !== this.ctx.props.sharingDomain) return collectionIds.map(() => false);
     let collections = this.ctx.exports.ContextCollectionDurableObject;
     return Promise.all(collectionIds.map(async collectionId => canReadCollection(
@@ -233,7 +235,8 @@ export class ContextGatekeeper
   #userLibraries() { return this.ctx.exports.UserLibraryDurableObject; }
   // One strategy over the same storage object for the DO's lifetime: the kit coordinates in-flight
   // reads in memory keyed on it.
-  readonly #observers = contextObserverStrategy(this.ctx.storage.kv, this.ctx.props.sharingDomain);
+  readonly #observers = contextObserverStrategy(
+      this.ctx.storage.kv, this.ctx.props.sharingDomain, p5ContextMaxObservers(this.env));
 
   async #loadSkills(
       collections: EnabledCollectionInfo[]):

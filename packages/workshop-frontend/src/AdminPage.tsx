@@ -16,6 +16,7 @@ import { latestReads } from './features/deployment-updates/latestReads'
 import { probeRouterTag } from './features/deployment-updates/probeRouterTag'
 import { isAdminTab, resolveAdminTab } from './adminTab'
 import { logRpcFailure } from './rpcErrors'
+import { P5AdminToggles } from './p5-admin-toggles'
 
 // Preset accent colors offered in the Theme section ('' = default brand).
 const ACCENT_PRESETS: { label: string; value: string }[] = [
@@ -555,6 +556,7 @@ export default function AdminPage() {
               />
             </div>
           </div>
+          <P5AdminToggles admin={admin.api} />
         </>
       )}
 

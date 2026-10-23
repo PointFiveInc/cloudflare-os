@@ -22,6 +22,7 @@ import {
 } from './components/BlueprintBindingCard'
 import { reportIssue } from './errorReporting'
 import { isImeComposing } from './keyboardEvent'
+import { P5UnusedConnections } from './p5-connection-delete'
 
 interface ConnectionsProps {
   overseer: RpcStub<Overseer>
@@ -360,6 +361,8 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
             </div>
           )}
         </section>
+
+        {!loading && <P5UnusedConnections overseer={overseer} bindings={bindings} vendorBranding={vendorBranding} />}
 
         {!loading && hooks.length > 0 && (
           <section className="mt-8">

@@ -122,6 +122,8 @@ import {
 import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDialog";
 import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
 import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
+import { useP5AtMentionPeople, withP5AtMentions, type AtMentionCandidate } from "./p5-at-mentions";
+import { useP5ShowsPendingChangesBar } from "./p5-turn-end-accept";
 
 /**
  * The selected chat's live (accepted but not yet materialized) change row stream, delivered via
@@ -1231,11 +1233,12 @@ const MARKDOWN_COMPONENTS_NO_CAPSULES = getMarkdownComponents();
  * single newlines as hard breaks, for text people typed rather than Markdown a model wrote.
  */
 export const MarkdownMessage = memo(function MarkdownMessage(
-  { message, capsules, formats, preserveLineBreaks }: {
+  { message, capsules, formats, preserveLineBreaks, p5People }: {
     message: string;
     capsules?: CapsuleSpecifier[];
     formats?: MessageFormatRef[];
     preserveLineBreaks?: boolean;
+    p5People?: readonly AtMentionCandidate[];
   },
 ): ReactNode {
   const tokenizedMessage = useMemo(
@@ -1262,7 +1265,7 @@ export const MarkdownMessage = memo(function MarkdownMessage(
   return (
     <ReactMarkdown
       skipHtml={true}
-      remarkPlugins={remarkPlugins}
+      remarkPlugins={withP5AtMentions(remarkPlugins, p5People, message)}
       components={components}
     >
       {tokenizedMessage?.markdown ?? message}
@@ -1782,7 +1785,7 @@ const ToolGroupRow = memo(function ToolGroupRow({
         )
       )}
       {footerChangeSequence !== undefined && footerTimestamp && footerLabel && onFooterRevert && (
-        <div className="ml-0 mt-0.5 flex items-center gap-1 opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
+        <div className="ml-0 mt-0.5 flex items-center gap-1 opacity-100 transition-opacity duration-150 ease-out">
           <Tooltip content={footerLabel} asChild>
             <button
               type="button"
@@ -3162,6 +3165,7 @@ function ChatInterface({
     }
     return sawSelf;
   }, [currentMessages, currentUser, queuedSteers]);
+  const p5PeopleFor = useP5AtMentionPeople(overseer, currentMessages, queuedSteers);
 
   const lastMessageSequence = currentMessages[currentMessages.length - 1]?.sequence;
 
@@ -3316,6 +3320,7 @@ function ChatInterface({
       provisionalToolCalls.length > 0);
 
   const isAgentActive = !!currentChatMetadata?.activeAgent;
+  const p5ShowsPendingChangesBar = useP5ShowsPendingChangesBar(isAgentActive);
   const activeAgent = currentChatMetadata?.activeAgent;
   // Names the chat's own model in the composer even when the picker no longer offers it.
   const chatAgent = activeAgent ?? inferChatAgentFromMessages(currentMessages);
@@ -4731,14 +4736,6 @@ function ChatInterface({
     return out;
   }, [currentMessages, isAgentActive]);
 
-  const latestCompletedAgentTurnMessageSeq = useMemo(() => {
-    let latest: number | null = null;
-    for (const sequence of completedAgentTurnMessageSeqs) {
-      if (latest === null || sequence > latest) latest = sequence;
-    }
-    return latest;
-  }, [completedAgentTurnMessageSeqs]);
-
   // The current epoch's opening sequence (see ChatCodeBase.epoch), zero when the epoch spans the
   // whole chat. A *pending* changes message before it exists only in chats converted from
   // pre-git storage -- its content rides the conversion boundary's collapsed change, and the
@@ -5860,7 +5857,7 @@ function ChatInterface({
                               <span className="min-w-0 truncate font-medium">
                                 {label}
                               </span>
-                              <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover/savedChanges:opacity-100 sm:group-focus-within/savedChanges:opacity-100">
+                              <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition-opacity duration-150 ease-out">
                                 {/* Edits from before the current epoch (i.e. before the chat's
                                     conversion to git-backed storage) can't be discarded
                                     individually -- only the banner's discard-all covers them. */}
@@ -5977,7 +5974,7 @@ function ChatInterface({
                               </span>
                             </div>
                             {endsUserGroup && (
-                              <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover/message:opacity-100 sm:group-focus-within/message:opacity-100">
+                              <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out">
                                 {!(hideOwnUserName && msg.author.id === currentUser?.id) && (
                                   <span className="font-medium">{msg.author.name}</span>
                                 )}
@@ -6022,11 +6019,12 @@ function ChatInterface({
                                     capsules={msg.capsules}
                                     formats={msg.formats}
                                     preserveLineBreaks
+                                    p5People={p5PeopleFor(msg.author.id)}
                                   />
                                 )}
                               </div>
                               {endsUserGroup && (
-                                <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover/message:opacity-100 sm:group-focus-within/message:opacity-100">
+                                <div className="mt-0.5 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive opacity-100 transition-opacity duration-150 ease-out">
                                   {/* hideOwnUserName implies currentUser is non-null (see memo). */}
                                   {!(hideOwnUserName && msg.author.id === currentUser?.id) && (
                                     <span className="font-medium">{msg.author.name}</span>
@@ -6060,8 +6058,6 @@ function ChatInterface({
                             const showActions =
                               completedAgentTurnMessageSeqs.has(actionMessageSeq) &&
                               (hasMessageText || (!!pendingChange && !attachActionsToToolGroups));
-                            const keepActionsVisible =
-                              actionMessageSeq === latestCompletedAgentTurnMessageSeq;
                             const showFooterOnGroupIndex = attachActionsToToolGroups && pendingChange && messageToolGroups
                               ? messageToolGroups.length - 1
                               : -1;
@@ -6083,11 +6079,7 @@ function ChatInterface({
                               )}
 
                               {showActions && (
-                                <div className={`mt-0.5 -ml-1 flex items-center gap-1 transition-opacity duration-150 ease-out ${
-                                  keepActionsVisible
-                                    ? "opacity-100"
-                                    : "opacity-100 sm:opacity-0 sm:group-hover/agentMessage:opacity-100 sm:group-focus-within/agentMessage:opacity-100"
-                                }`}>
+                                <div className="mt-0.5 -ml-1 flex items-center gap-1 transition-opacity duration-150 ease-out opacity-100">
                                   {hasMessageText && (
                                     <Tooltip content="Copy message" asChild>
                                       <button
@@ -6520,7 +6512,7 @@ function ChatInterface({
                       return (
                         <div key={index} className={`flex flex-col items-end ${sameAuthorAsPrevious ? "mt-2" : "mt-5"}`}>
                           <div className={`${userBubbleClassName} opacity-60`}>
-                            <MarkdownMessage message={steer.text} preserveLineBreaks />
+                            <MarkdownMessage message={steer.text} preserveLineBreaks p5People={p5PeopleFor(steer.author.id)} />
                           </div>
                           {next?.author.id !== steer.author.id && (
                             <div className="mt-1 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive">
@@ -6582,6 +6574,7 @@ function ChatInterface({
                       if (!currentChatMetadata ||
                           !(chatHasProposedChanges(currentChatMetadata) ||
                             hasPendingBlueprintProposal)) return null;
+                      if (!p5ShowsPendingChangesBar) return null;
 
                       // Accepting always merges everything the chat proposes (drafts swept in,
                       // no partial accepts -- see Overseer.mergeChanges()), so the banner needs
