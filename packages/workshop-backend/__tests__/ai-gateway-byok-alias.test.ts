@@ -24,9 +24,31 @@ const PROVIDER_CONFIGS: AiModelConfig[] = [
 
 const sentRequests: Request[] = [];
 
+const refusal = () =>
+  Response.json({ error: { type: "bad_request", message: "stubbed" } }, { status: 400 });
+
+// An empty Anthropic reply that read most of its prompt from the provider's cache, so the handle
+// keeps the request to resend.
+const cachedReply = () => new Response([
+  { type: "message_start", message: {
+    id: "message", type: "message", role: "assistant", model: "claude", content: [],
+    stop_reason: null, stop_sequence: null,
+    usage: {
+      input_tokens: 10, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 0,
+      output_tokens: 1,
+    },
+  } },
+  { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null },
+    usage: { output_tokens: 1 } },
+  { type: "message_stop" },
+].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+    { headers: { "content-type": "text/event-stream" } });
+
+let answer = refusal;
+
 const captureFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   sentRequests.push(new Request(input as RequestInfo, init));
-  return Response.json({ error: { type: "bad_request", message: "stubbed" } }, { status: 400 });
+  return answer();
 }) as typeof fetch;
 
 const TRANSPORTS = [
@@ -45,6 +67,7 @@ const TRANSPORTS = [
 describe.each(TRANSPORTS)("cf-aig-byok-alias over the $transport transport", (transport) => {
   beforeEach(() => {
     sentRequests.length = 0;
+    answer = refusal;
   });
 
   function gatewayEnv(alias: string | undefined): Cloudflare.Env {
@@ -93,5 +116,23 @@ describe.each(TRANSPORTS)("cf-aig-byok-alias over the $transport transport", (tr
     expect(sentRequests).toHaveLength(1);
     expect(await sentRequests[0].clone().json()).toHaveProperty("compaction.type", "summarize");
     expect(sentRequests[0].headers.get("cf-aig-byok-alias")).toBe("pointfive-os");
+  }, 15000);
+
+  // A cache warm resend replays the turn's request from what the handle kept of it, with headers
+  // of its own; the alias must survive them, or every warm ping bills the "default" key.
+  it("names the configured alias on a cache warm resend", async () => {
+    answer = cachedReply;
+    const handle = getModel(gatewayEnv("pointfive-os"),
+        { provider: "anthropic", model: "claude-opus-5-5", apiToken: "ignored-in-gateway-mode" },
+        INITIATOR);
+    const message = await handle.stream(handle.model, {
+      messages: [{ role: "user", content: "hello", timestamp: 0 }],
+    }, { ...transport.streamOptions, maxRetries: 0 }).result();
+    expect(message.stopReason).toBe("stop");
+    await expect(handle.lastRequest?.resend())
+        .resolves.toMatchObject({ usage: { cacheRead: 90_000 } });
+    expect(sentRequests).toHaveLength(2);
+    expect(await sentRequests[1].clone().json()).toHaveProperty("max_tokens", 1);
+    expect(sentRequests[1].headers.get("cf-aig-byok-alias")).toBe("pointfive-os");
   }, 15000);
 });
