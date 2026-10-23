@@ -3,7 +3,7 @@
 
 import { act } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import type { CollaboratorRole, GadgetBindingInfo, ObserverBindingNeed } from '@gadgets/workshop-shared/api'
+import type { BoundHookInfo, CollaboratorRole, GadgetBindingInfo, ObserverBindingNeed } from '@gadgets/workshop-shared/api'
 
 const addToast = vi.hoisted(() => vi.fn<(options: unknown) => void>())
 
@@ -46,6 +46,7 @@ type Connection = {
   url?: string
   usedByGadget: boolean
   boundHere?: { name: string; draft?: boolean }
+  hook?: { gadgetId: number; enabled: boolean }
 }
 
 const DRIVE: Connection = {
@@ -60,10 +61,14 @@ const DRAFT_DOC: Connection = {
 const BOUND_DOC: Connection = {
   id: 15, type: 'gatekeeper', title: 'Bound doc', usedByGadget: true, boundHere: { name: 'DOC' },
 }
+const HOOKED_SHEET: Connection = {
+  id: 16, type: 'gatekeeper', title: 'Hooked sheet', usedByGadget: false, hook: { gadgetId: 2, enabled: false },
+}
 
 /**
  * A workspace as the overseer reports it to a viewer: "Workspace" scope is every connection,
- * "Gadget only" scope the ones a gadget uses. A "Gadget only" viewer's overseer refuses both reads.
+ * "Gadget only" scope the ones a gadget uses, and the hooks list each hook with its connection. A
+ * "Gadget only" viewer's overseer refuses both scope reads.
  */
 function workspace(connections: Connection[], viewer: 'Workspace' | 'Gadget only' = 'Workspace') {
   const server = { connections: connections.map(c => ({ ...c })) }
@@ -83,7 +88,10 @@ function workspace(connections: Connection[], viewer: 'Workspace' | 'Gadget only
     removed.push(id)
   })
   const overseer = {
-    listHooks: async () => [],
+    listHooks: async (): Promise<BoundHookInfo[]> => server.connections.filter(c => c.hook).map(c => ({
+      id: c.id, gatekeeperId: c.id, gadgetId: c.hook!.gadgetId, resourceTitle: c.title,
+      description: { title: 'New row', description: 'Call this hook with each new row.' }, enabled: c.hook!.enabled,
+    })),
     listObserverRequirements: async (role: CollaboratorRole) => {
       scopesRead.add(role)
       if (viewer === 'Gadget only') deny()
@@ -175,6 +183,12 @@ it('shows nothing when every connection is used by a gadget', async () => {
 
   expect([...ws.scopesRead].toSorted()).toEqual(['build', 'use'])
   expect(unusedSection()).toBeNull()
+})
+
+it('does not list a connection that only a disabled hook uses', async () => {
+  await render(workspace([DRIVE, HOOKED_SHEET]))
+
+  expect(rowTitles(unusedSection())).toEqual(['Google Drive Account'])
 })
 
 it('shows a "Gadget only" viewer no section and no toast', async () => {

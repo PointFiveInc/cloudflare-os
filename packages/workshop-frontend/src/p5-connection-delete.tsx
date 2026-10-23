@@ -19,18 +19,24 @@ export const UNUSED_CONNECTION_WORDS = {
 
 /**
  * The workspace's connections a "Workspace" collaborator is checked against and a "Gadget only"
- * one is not, less this gadget's own bindings and any ambient connection. A connection bound only
- * to a chat, or to a gadget still a draft, is among them.
+ * one is not, less this gadget's own bindings, every connection a hook uses (a disabled hook's
+ * too, since `remove()` deletes it) and any ambient connection. A connection bound only to a
+ * chat, or to a gadget still a draft, is among them.
  */
 export async function listUnusedConnections(
   overseer: RpcStub<Overseer>,
   bindings: GadgetBindingInfo[],
 ): Promise<ObserverBindingNeed[]> {
-  const [use, build] = await Promise.all([
+  const [use, build, hooks] = await Promise.all([
     overseer.listObserverRequirements('use'),
     overseer.listObserverRequirements('build'),
+    overseer.listHooks(),
   ])
-  const reached = new Set([...use.map(need => need.gatekeeperId), ...bindings.map(binding => binding.target)])
+  const reached = new Set([
+    ...use.map(need => need.gatekeeperId),
+    ...bindings.map(binding => binding.target),
+    ...hooks.map(hook => hook.gatekeeperId),
+  ])
   const candidates = build.filter(need => !reached.has(need.gatekeeperId))
   const types = await Promise.all(candidates.map(async need => {
     const gatekeeper = await overseer.getGatekeeperById(need.gatekeeperId)
