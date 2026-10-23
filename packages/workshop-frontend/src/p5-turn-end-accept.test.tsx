@@ -82,6 +82,7 @@ async function renderChat(turnEndAccept: boolean | null, metadata: AiChatMetadat
     listChats: async () => [metadata],
     listModels: async () => [],
     onRpcBroken: () => {},
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
     subscribeToChat: (next: AiChatSubscriber) => {
       subscriber = next
       return { [Symbol.dispose]: () => {} }
