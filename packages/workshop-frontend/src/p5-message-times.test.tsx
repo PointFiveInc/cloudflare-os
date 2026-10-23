@@ -99,6 +99,7 @@ async function renderChat() {
     listChats: async () => [chat],
     listModels: async () => [],
     onRpcBroken: () => {},
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
     subscribeToChat: () => ({ [Symbol.dispose]: () => {} }),
   })
   await testRoot.render(

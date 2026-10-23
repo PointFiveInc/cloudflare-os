@@ -67,6 +67,7 @@ async function openChat(models: AiChatAuthorInfo[], messages: AiChatMessage[], c
     listChats: async () => [chat],
     listModels: async () => models,
     onRpcBroken: () => {},
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
     subscribeToChat: () => ({ [Symbol.dispose]: () => {} }),
   })
   await testRoot.render(
