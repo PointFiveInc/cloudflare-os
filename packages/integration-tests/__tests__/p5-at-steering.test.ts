@@ -33,6 +33,7 @@ const GOOGLE: GatekeeperSpec = {
   dir: resolve(dirname(fileURLToPath(import.meta.url)), "../../gatekeeper-google"),
   patch: config => {
     delete config.build;
+    delete config.ai;
     config.vars = {
       ...config.vars, BASE_URL: GOOGLE_BASE_URL, CLIENT_ID: "test-client", CLIENT_SECRET: "test-secret",
     };
