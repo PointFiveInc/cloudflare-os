@@ -811,6 +811,7 @@ describe('a send before the people load', { timeout: 20_000 }, () => {
       listChats: async () => [chat],
       listModels: async () => [AGENT],
       onRpcBroken: () => {},
+      viewChat: () => ({ [Symbol.dispose]: () => {} }),
       subscribeToChat: () => ({ [Symbol.dispose]: () => {} }),
       [Symbol.dispose]: () => {},
     }

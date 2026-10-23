@@ -109,6 +109,7 @@ function makeServer(
     listChats: async () => [meta],
     listModels: async () => models,
     onRpcBroken: () => {},
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
     subscribeToChat: (subscriber: AiChatSubscriber) => {
       subscribers.push(subscriber)
       return { [Symbol.dispose]: () => {} }
@@ -188,7 +189,7 @@ describe('a sent "@" in a workspace chat', { timeout: 20_000 }, () => {
     const server = makeServer([message(1, OLIVE, { message: 'Build it.' })], [collaborator(BOB, 'build')], { meta })
     await renderChat(server, 'see this')
     await vi.waitFor(() => expect(marks()).toEqual(['@Bob Baker']))
-    expect(markElements()[0]!.closest('.whitespace-pre-wrap')?.textContent).toBe('@Bob Baker see this')
+    expect(markElements()[0]!.closest('p')?.textContent).toBe('@Bob Baker see this')
   })
 })
 
