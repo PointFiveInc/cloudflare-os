@@ -108,7 +108,7 @@ describe('PageUpdateNotice', () => {
 
     expect(liveToasts()).toHaveLength(1)
     expect(liveToasts()[0]).toMatchObject({
-      title: 'Cloudflare OS was updated', description: 'Reload to use the new version.', timeout: 0,
+      title: 'PointFive OS was updated', description: 'Reload to use the new version.', timeout: 0,
     })
 
     await sessionCheck()

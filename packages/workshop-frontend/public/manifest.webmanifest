@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "Cloudflare OS",
-  "short_name": "Cloudflare OS",
+  "name": "PointFive OS",
+  "short_name": "PointFive OS",
   "description": "Your workspaces, AI agents, and personal apps.",
   "start_url": "/",
   "scope": "/",
