@@ -412,18 +412,31 @@ describe("Cloudflare code PointFive's changes lean on", () => {
     });
   });
 
-  it("marks: one workspace open in the Worker, in #openGadgetInternal", () => {
-    const server = sourceAt(cloudflareSources(BACKEND), `${BACKEND}/server.ts`);
+  it("marks: one workspace open in the Worker, in #openGadgetInternal, and one workspace delete, in the " +
+      "client's deleteSelf", () => {
+    const backend = cloudflareSources(BACKEND);
+    const server = sourceAt(backend, `${BACKEND}/server.ts`);
+    const client = typeBody(sourceAt(backend, `${BACKEND}/overseer.ts`), "OverseerClientInterface");
+    const deleteSelf = memberBody(client, "deleteSelf");
     const found = {
       opens: occurrences([server], "overseer.open("),
       opensInOpenGadgetInternal: occurrences([memberBody(server, "#openGadgetInternal")], "overseer.open("),
+      ownerListRemovals: occurrences(backend, ".deleteGadget("),
+      ownerListRemovalsInDeleteSelf: occurrences([deleteSelf], ".deleteGadget("),
+      storageWipes: occurrences(backend, "storage.deleteAll()"),
+      storageWipesInDeleteSelf: occurrences([deleteSelf], "storage.deleteAll()"),
     };
 
     expect(Object.fromEntries(Object.entries(found).map(([pin, places]) => [pin, places.length])),
-      "a new way for the Worker to open a workspace skips the mark clear in p5-marks.ts: re-check it and " +
-      `its hook in #openGadgetInternal. Found: ${JSON.stringify(found, null, 2)}`).toEqual({
+      "a new way for the Worker to open a workspace skips the mark clear in p5-marks.ts, and a new way to " +
+      "delete one skips its shared-listings clean-up: re-check it and its hooks in #openGadgetInternal and " +
+      `the client's deleteSelf. Found: ${JSON.stringify(found, null, 2)}`).toEqual({
       opens: 1,
       opensInOpenGadgetInternal: 1,
+      ownerListRemovals: 1,
+      ownerListRemovalsInDeleteSelf: 1,
+      storageWipes: 1,
+      storageWipesInDeleteSelf: 1,
     });
   });
 
